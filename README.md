@@ -1,13 +1,15 @@
 # CrowdStrike Falcon MCP Server
 
-AI-powered security operations platform for CrowdStrike Falcon. Provides an MCP (Model Context Protocol) server, an 11-tab Streamlit dashboard ("Falcon Vantage"), and a CLI client for querying Falcon security data using natural language.
+AI-powered security operations platform for CrowdStrike Falcon. Built on [FalconPy](https://github.com/CrowdStrike/falconpy) (CrowdStrike's official Python SDK) and the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). Includes an MCP server, an 11-tab Streamlit dashboard ("Falcon Vantage"), and a CLI client for querying Falcon security data using natural language.
 
 ## Features
 
+- **Built on FalconPy** — Uses CrowdStrike's official Python SDK for all Falcon platform interactions (12 service classes, read-only)
 - **13 MCP Tools** — search alerts, detections, cases, vulnerabilities, hosts, ThreatGraph IOCs, security posture, NGSIEM ingestion, identity protection, cloud security, exposure management, FQL validation, and more
 - **4 MCP Resources** — FQL cheatsheet, severity definitions, MITRE ATT&CK mapping, case status guide
 - **5 MCP Prompts** — case triage, threat hunting, vulnerability assessment, executive briefing, identity risk review
 - **11-Tab Dashboard** — Executive summary, detections, cases, vulnerabilities, identity, cloud security, exposure, IOC search, data ingestion, FQL tools, AI chat
+- **Multi-Provider LLM Support** — Anthropic and OpenAI API formats, selectable via `LLM_PROVIDER` env var
 - **Background Cache** — pre-fetches all Falcon data sources for instant dashboard loads with file persistence
 - **CLI Chat Client** — interactive terminal-based Q&A with full tool access
 
@@ -17,7 +19,8 @@ AI-powered security operations platform for CrowdStrike Falcon. Provides an MCP 
 
 - Python 3.10+
 - CrowdStrike Falcon API credentials (API Clients & Keys in your Falcon console)
-- *(Optional)* An LLM endpoint compatible with the Anthropic Messages API for AI chat
+- [CrowdStrike FalconPy](https://github.com/CrowdStrike/falconpy) (>=1.6.0, installed via requirements.txt)
+- *(Optional)* An LLM endpoint (Anthropic or OpenAI compatible) for AI chat features
 
 ### Installation
 
@@ -121,10 +124,10 @@ Missing scopes are detected and shown in the sidebar so you know what to enable.
 | `FALCON_CLIENT_ID` | Yes | Falcon API client ID |
 | `FALCON_CLIENT_SECRET` | Yes | Falcon API client secret |
 | `FALCON_BASE_URL` | Yes | Falcon cloud base URL (see `.env.example` for regions) |
-| `LLM_ENDPOINT` | No | Anthropic Messages API-compatible endpoint for AI chat |
+| `LLM_ENDPOINT` | No | LLM endpoint URL for AI chat |
 | `LLM_API_KEY` | No | API key for the LLM endpoint |
-
-Legacy env var names `GENAI_HUB_URL` / `GENAI_API_KEY` are also supported.
+| `LLM_PROVIDER` | No | `anthropic` (default) or `openai` |
+| `LLM_MODEL` | No | Model override (defaults: `claude-4-6-opus` / `gpt-4o`) |
 
 The `.env` file supports multiple CID profiles using a comment/uncomment pattern. The dashboard sidebar includes a profile switcher.
 
