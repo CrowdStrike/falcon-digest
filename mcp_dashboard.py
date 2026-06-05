@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Falcon Digest — Dashboard (v1)
-Ask your Falcon data anything.
+Ask your Falcon data anything...
 """
 
 import streamlit as st
@@ -841,7 +841,10 @@ with st.sidebar:
 st.markdown(f"""
 <div class="main-header">
     <span style="display:inline-block; height:36px; width:36px;">{_CS_FALCON_SVG}</span>
-    <h1>Falcon Digest</h1>
+    <div>
+        <h1>Falcon Digest</h1>
+        <p style="margin:0; padding:0; font-size:0.85rem; color:#6B7280; font-weight:400; letter-spacing:0.02em;">Ask your Falcon data anything...</p>
+    </div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -2889,14 +2892,14 @@ with tab_chat:
                     api_messages.append({"role": "user", "content": tool_results})
                     response = call_llm(api_messages, TOOL_DEFINITIONS)
 
-                final_text = ""
-                for block in response.get("content", []):
-                    if block.get("type") == "text":
-                        final_text += block.get("text", "")
-                if final_text:
-                    # Stream the response word-by-word into the chat container
-                    stream_to_chat(chat_container, final_text)
-                    st.session_state.chat_messages.append({"role": "assistant", "content": final_text})
+            # Extract final text outside spinner so overlay is gone during streaming
+            final_text = ""
+            for block in response.get("content", []):
+                if block.get("type") == "text":
+                    final_text += block.get("text", "")
+            if final_text:
+                stream_to_chat(chat_container, final_text)
+                st.session_state.chat_messages.append({"role": "assistant", "content": final_text})
 
         except Exception as e:
             _logger.error("LLM error: %s", e, exc_info=True)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Falcon Digest — Dashboard
-Ask your Falcon data anything.
+Ask your Falcon data anything...
 """
 
 import streamlit as st
@@ -769,7 +769,10 @@ if "chat_open" not in st.session_state:
 
 st.markdown("""
 <div class="main-header">
-    <h1>Falcon Digest</h1>
+    <div>
+        <h1>Falcon Digest</h1>
+        <p style="margin:0; padding:0; font-size:0.85rem; color:#6B7280; font-weight:400; letter-spacing:0.02em;">Ask your Falcon data anything...</p>
+    </div>
 </div>
 """, unsafe_allow_html=True)
 
