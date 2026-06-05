@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Falcon Vantage — Dashboard
-Bird's-eye view across your CrowdStrike Falcon environment.
+Falcon Digest — Dashboard
+Ask your Falcon data anything.
 """
 
 import streamlit as st
@@ -35,7 +35,7 @@ _logger = logging.getLogger("falcon_mcp.dashboard")
 # ============ PAGE CONFIG ============
 
 st.set_page_config(
-    page_title="Falcon Vantage",
+    page_title="Falcon Digest",
     page_icon="https://www.crowdstrike.com/wp-content/uploads/2022/01/favicon.png",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -47,7 +47,7 @@ try:
     validate_config()
 except ConfigError as e:
     st.error(
-        "**Falcon Vantage cannot start — required configuration is missing.**\n\n"
+        "**Falcon Digest cannot start — required configuration is missing.**\n\n"
         + str(e).replace("\n", "\n\n"),
         icon="\u274C"
     )
@@ -521,7 +521,7 @@ def stream_to_chat(container, text, label="Vantage AI"):
 # ============ SIDEBAR ============
 
 with st.sidebar:
-    st.markdown("### Falcon Vantage")
+    st.markdown("### Falcon Digest")
 
     st.markdown(
         '<span class="status-dot status-connected"></span> **Falcon API Connected**',
@@ -769,7 +769,7 @@ if "chat_open" not in st.session_state:
 
 st.markdown("""
 <div class="main-header">
-    <h1>Falcon Vantage</h1>
+    <h1>Falcon Digest</h1>
 </div>
 """, unsafe_allow_html=True)
 
@@ -2153,7 +2153,7 @@ with _sidebar_chat_ph.container():
 # ============ FOOTER ============
 
 st.divider()
-st.caption(f"Falcon Vantage v2.0 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"Falcon Digest v2.0 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 if auto_refresh:
     import time

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Falcon Vantage — Data Cache
+Falcon Digest — Data Cache
 Background polling and TTL-based caching for instant dashboard loads.
 """
 
@@ -428,7 +428,7 @@ class FalconCache:
             if age > self.ttl * 2:
                 lines.append(f"WARNING: Cache data is {int(age/60)} minutes old (stale)")
 
-        lines.append(f"=== FALCON VANTAGE CACHED DATA (refreshed {self._last_refresh.strftime('%H:%M:%S UTC') if self._last_refresh else 'never'}) ===")
+        lines.append(f"=== FALCON DIGEST CACHED DATA (refreshed {self._last_refresh.strftime('%H:%M:%S UTC') if self._last_refresh else 'never'}) ===")
         lines.append("")
 
         # Security posture

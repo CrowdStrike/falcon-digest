@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-QA Validation Script — Falcon Vantage New Tabs
+QA Validation Script — Falcon Digest New Tabs
 Validates all changes for Identity Protection, Cloud Security, and Exposure Management tabs.
 """
 
@@ -33,7 +33,7 @@ def warn(name, detail=""):
 
 
 print("\n" + "=" * 60)
-print("  FALCON VANTAGE — QA VALIDATION")
+print("  FALCON DIGEST — QA VALIDATION")
 print("=" * 60)
 
 # ============================================================

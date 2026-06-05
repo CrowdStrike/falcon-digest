@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Falcon Vantage — Dashboard (v1)
-Bird's-eye view across your CrowdStrike Falcon environment.
+Falcon Digest — Dashboard (v1)
+Ask your Falcon data anything.
 """
 
 import streamlit as st
@@ -34,7 +34,7 @@ _logger = logging.getLogger("falcon_mcp.dashboard")
 # ============ PAGE CONFIG ============
 
 st.set_page_config(
-    page_title="Falcon Vantage",
+    page_title="Falcon Digest",
     page_icon="https://www.crowdstrike.com/wp-content/uploads/2022/01/favicon.png",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -46,7 +46,7 @@ try:
     validate_config()
 except ConfigError as e:
     st.error(
-        "**Falcon Vantage cannot start — required configuration is missing.**\n\n"
+        "**Falcon Digest cannot start — required configuration is missing.**\n\n"
         + str(e).replace("\n", "\n\n"),
         icon="\u274C"
     )
@@ -609,7 +609,7 @@ _SCROLL_JS = """
 """
 
 
-def stream_to_chat(container, text, label="Falcon Vantage"):
+def stream_to_chat(container, text, label="Falcon Digest"):
     """Stream text word-by-word into a chat container with typewriter effect."""
     text = html.escape(text)
     with container:
@@ -635,7 +635,7 @@ def stream_to_chat(container, text, label="Falcon Vantage"):
 # ============ SIDEBAR ============
 
 with st.sidebar:
-    st.markdown(f'<div style="display:flex; align-items:center; gap:8px;"><span style="display:inline-flex; align-items:center; height:24px; width:24px;">{_CS_FALCON_SVG}</span><h3 style="color: #EC0000; margin: 0; padding: 0; line-height: 1;">Falcon Vantage</h3></div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="display:flex; align-items:center; gap:8px;"><span style="display:inline-flex; align-items:center; height:24px; width:24px;">{_CS_FALCON_SVG}</span><h3 style="color: #EC0000; margin: 0; padding: 0; line-height: 1;">Falcon Digest</h3></div>', unsafe_allow_html=True)
 
     st.markdown(
         '<span class="status-dot status-connected"></span> **Falcon API Connected**',
@@ -831,7 +831,7 @@ with st.sidebar:
 - **Vulnerabilities** — Spotlight vulnerability data
 - **ThreatGraph** — IOC search
 - **FQL Tools** — Validate FQL filters, look up hosts
-- **Ask Falcon Vantage** — Natural-language Q&A
+- **Ask Falcon Digest** — Natural-language Q&A
         """)
 
     st.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
@@ -841,7 +841,7 @@ with st.sidebar:
 st.markdown(f"""
 <div class="main-header">
     <span style="display:inline-block; height:36px; width:36px;">{_CS_FALCON_SVG}</span>
-    <h1>Falcon Vantage</h1>
+    <h1>Falcon Digest</h1>
 </div>
 """, unsafe_allow_html=True)
 
@@ -889,7 +889,7 @@ _ALL_TAB_LABELS = [
     "Vulnerabilities",
     "IOC Search",
     "FQL Tools",
-    "Ask Falcon Vantage",
+    "Ask Falcon Digest",
 ]
 
 _active_modules: set[str] | None = None
@@ -919,7 +919,7 @@ tab_cases = _tabs["Cases"]
 tab_vulns = _tabs["Vulnerabilities"]
 tab_tg = _tabs["IOC Search"]
 tab_fql = _tabs["FQL Tools"]
-tab_chat = _tabs["Ask Falcon Vantage"]
+tab_chat = _tabs["Ask Falcon Digest"]
 
 # Subscription-gated tabs (None if not subscribed)
 tab_ingestion = _tabs.get("Data Ingestion")
@@ -2808,7 +2808,7 @@ with tab_fql:
 # ============ TAB 11: AI CHAT ============
 
 with tab_chat:
-    st.subheader("Ask Falcon Vantage")
+    st.subheader("Ask Falcon Digest")
     st.caption("Powered by CrowdStrike Falcon Platform with full MCP tool access")
 
     if "chat_messages" not in st.session_state:
@@ -2841,7 +2841,7 @@ with tab_chat:
             if msg["role"] == "user":
                 st.markdown(f'<div class="chat-user"><strong>You:</strong> {html.escape(msg["content"])}</div>', unsafe_allow_html=True)
             elif msg["role"] == "assistant":
-                st.markdown(f'<div class="chat-assistant"><strong>Falcon Vantage:</strong> {html.escape(msg["content"])}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="chat-assistant"><strong>Falcon Digest:</strong> {html.escape(msg["content"])}</div>', unsafe_allow_html=True)
             elif msg["role"] == "tool_call":
                 with st.expander(f"Tool: {msg['tool_name']}", expanded=False):
                     st.json(msg.get("input", {}))
@@ -2866,7 +2866,7 @@ with tab_chat:
         api_messages = [{"role": "user", "content": active_input}]
 
         try:
-            with st.spinner("Falcon Vantage is thinking..."):
+            with st.spinner("Falcon Digest is thinking..."):
                 response = call_llm(api_messages, TOOL_DEFINITIONS)
 
                 max_iterations = 10
@@ -2900,7 +2900,7 @@ with tab_chat:
 
         except Exception as e:
             _logger.error("LLM error: %s", e, exc_info=True)
-            err_msg = "Sorry, I'm having trouble connecting to Falcon Vantage right now. Please try again in a moment."
+            err_msg = "Sorry, I'm having trouble connecting to Falcon Digest right now. Please try again in a moment."
             stream_to_chat(chat_container, err_msg)
             st.session_state.chat_messages.append({
                 "role": "assistant",
@@ -2915,7 +2915,7 @@ with tab_chat:
 # ============ FOOTER ============
 
 st.divider()
-st.caption(f"Falcon Vantage v1.0 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"Falcon Digest v1.0 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 if auto_refresh:
     _last_refresh = st.session_state.get("_last_auto_refresh", 0)

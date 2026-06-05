@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Falcon Vantage — MCP Server
+Falcon Digest — MCP Server
 Bird's-eye view across your CrowdStrike Falcon environment.
 13 tools, 4 resources, 5 prompts
 """
@@ -80,7 +80,7 @@ def validate_config():
 
 
 # Initialize server
-server = Server("falcon-vantage")
+server = Server("falcon-digest")
 
 # ============ HELPER FUNCTIONS ============
 
@@ -149,7 +149,7 @@ def get_falcon_client(service_class):
                 client_id=os.getenv("FALCON_CLIENT_ID"),
                 client_secret=os.getenv("FALCON_CLIENT_SECRET"),
                 base_url=os.getenv("FALCON_BASE_URL", "https://api.crowdstrike.com"),
-                user_agent="falcon-vantage/1.0"
+                user_agent="falcon-digest/1.0"
             )
         return _client_cache[class_name]
 
@@ -1424,7 +1424,7 @@ async def get_ngsiem_ingestion(hours: int = 24) -> str:
                     client_secret=os.getenv("FALCON_CLIENT_SECRET"),
                     base_url=os.getenv("FALCON_BASE_URL", "https://api.crowdstrike.com"),
                     member_cid=child_cid,
-                    user_agent="falcon-vantage/1.0",
+                    user_agent="falcon-digest/1.0",
                 )
                 qr = await asyncio.to_thread(
                     _run_ngsiem_query, child_ngsiem, logscale_query, start_str,
@@ -2690,7 +2690,7 @@ async def main():
             read_stream,
             write_stream,
             InitializationOptions(
-                server_name="falcon-vantage",
+                server_name="falcon-digest",
                 server_version="2.0.0",
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),

@@ -1,6 +1,6 @@
 # CrowdStrike Falcon MCP Server
 
-AI-powered security operations platform for CrowdStrike Falcon. Built on [FalconPy](https://github.com/CrowdStrike/falconpy) (CrowdStrike's official Python SDK) and the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). Includes an MCP server, an 11-tab Streamlit dashboard ("Falcon Vantage"), and a CLI client for querying Falcon security data using natural language.
+AI-powered security operations platform for CrowdStrike Falcon. Built on [FalconPy](https://github.com/CrowdStrike/falconpy) (CrowdStrike's official Python SDK) and the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). Includes an MCP server, an 11-tab Streamlit dashboard ("Falcon Digest"), and a CLI client for querying Falcon security data using natural language.
 
 ## Features
 

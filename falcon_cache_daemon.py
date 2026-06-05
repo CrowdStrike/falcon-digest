@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Falcon Vantage — Cache Daemon
+Falcon Digest — Cache Daemon
 Standalone background process that keeps .falcon_cache.json warm
 so dashboards load instantly.
 
