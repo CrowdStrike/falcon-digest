@@ -2918,7 +2918,7 @@ with tab_chat:
 # ============ FOOTER ============
 
 st.divider()
-st.caption(f"Falcon Digest v1.0 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"Falcon Digest v1.0.0 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 if auto_refresh:
     _last_refresh = st.session_state.get("_last_auto_refresh", 0)

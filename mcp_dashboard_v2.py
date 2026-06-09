@@ -2156,7 +2156,7 @@ with _sidebar_chat_ph.container():
 # ============ FOOTER ============
 
 st.divider()
-st.caption(f"Falcon Digest v2.0 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"Falcon Digest v1.0.0 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 if auto_refresh:
     import time
