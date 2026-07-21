@@ -1,0 +1,41 @@
+# Environment
+.env
+venv/
+__pycache__/
+*.pyc
+
+# Cache files
+.falcon_cache.json
+.falcon_cache.json.tmp
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# pytest
+.pytest_cache/
+
+# Backups, logs, PID files
+*.bak*
+*.log
+.falcon_cache_daemon.pid
+.falcon_cache_backups/
+
+# Legacy test files (integration, require live API)
+test_auth.py
+test_genai_hub.py
+test_mcp.py
+test_ngsiem_repos.py
+test_ngsiem_size.py
+
+# Claude Code session data
+.claude/
+
+# Development context (local only)
+CLAUDE.md
+context.md
+PUBLISH_REQUEST.md
+PUBLISH_REQUEST.txt
+HANDOFF_GUIDE.txt
+mcp_dashboard_v2.py
