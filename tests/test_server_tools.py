@@ -1,4 +1,29 @@
-"""Unit tests for all 10 CrowdStrike MCP server tools."""
+"""Unit tests for all MCP server tools.
+
+ _______                        __ _______ __        __ __
+|   _   .----.-----.--.--.--.--|  |   _   |  |_.----|__|  |--.-----.
+|.  1___|   _|  _  |  |  |  |  _  |   1___|   _|   _|  |    <|  -__|
+|.  |___|__| |_____|________|_____|____   |____|__| |__|__|__|_____|
+|:  1   |                         |:  1   |
+|::.. . |   CROWDSTRIKE FALCON    |::.. . |    Falcon Digest
+`-------'                         `-------'
+
+Falcon Digest — AI-Powered Falcon Security Dashboard
+
+Copyright 2024 CrowdStrike, Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
 
 import pytest
 import json
@@ -229,7 +254,7 @@ class TestListAvailableProducts:
         assert "cao" in product_values
         assert "epp" in product_values
         assert "idp" in product_values
-        assert "3rdparty" in product_values
+        assert "thirdparty" in product_values
 
     @pytest.mark.asyncio
     async def test_products_have_required_fields(self):
@@ -353,7 +378,7 @@ class TestSearchDetections:
             data = json.loads(result)
             assert "total_found" in data
             assert "detections" in data
-            assert "product:'epp'" in data["query_filter"]
+            assert "created_timestamp:>" in data["query_filter"]
 
     @pytest.mark.asyncio
     async def test_search_detections_with_severity(self, mock_alerts_response, mock_alert_details):

@@ -1,7 +1,29 @@
 #!/usr/bin/env python3
-"""
-Falcon Digest — Dashboard (v1)
-Ask anything to your Falcon data...
+"""Streamlit dashboard for CrowdStrike Falcon security operations.
+
+ _______                        __ _______ __        __ __
+|   _   .----.-----.--.--.--.--|  |   _   |  |_.----|__|  |--.-----.
+|.  1___|   _|  _  |  |  |  |  _  |   1___|   _|   _|  |    <|  -__|
+|.  |___|__| |_____|________|_____|____   |____|__| |__|__|__|_____|
+|:  1   |                         |:  1   |
+|::.. . |   CROWDSTRIKE FALCON    |::.. . |    Falcon Digest
+`-------'                         `-------'
+
+Falcon Digest — AI-Powered Falcon Security Dashboard
+
+Copyright 2024 CrowdStrike, Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 """
 
 import streamlit as st
