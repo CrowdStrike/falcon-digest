@@ -1,5 +1,5 @@
 crowdstrike-falconpy==1.6.0
-mcp==1.26.0
+mcp>=1.28.1
 streamlit==1.54.0
 plotly>=5.18.0
 pandas>=2.0.0
