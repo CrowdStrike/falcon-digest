@@ -1,4 +1,19 @@
-"""Tests for FalconCache."""
+"""Unit tests for the FalconCache background polling system.
+
+ _______                        __ _______ __        __ __
+|   _   .----.-----.--.--.--.--|  |   _   |  |_.----|__|  |--.-----.
+|.  1___|   _|  _  |  |  |  |  _  |   1___|   _|   _|  |    <|  -__|
+|.  |___|__| |_____|________|_____|____   |____|__| |__|__|__|_____|
+|:  1   |                         |:  1   |
+|::.. . |   CROWDSTRIKE FALCON    |::.. . |    Falcon Digest
+`-------'                         `-------'
+
+Falcon Digest — AI-Powered Falcon Security Dashboard
+
+Copyright 2024 CrowdStrike, Inc.
+
+MIT License — see LICENSE file for details.
+"""
 
 import pytest
 import json
@@ -318,7 +333,8 @@ class TestFalconCacheFilePersistence:
             assert os.path.exists(fc_mod.CACHE_FILE)
             with open(fc_mod.CACHE_FILE) as f:
                 data = json.load(f)
-            assert "k" in data
+            assert "entries" in data
+            assert "k" in data["entries"]
 
             # Temp file should not exist after successful save
             assert not os.path.exists(fc_mod.CACHE_FILE + ".tmp")

@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""
-Falcon Digest — Cache Daemon
-Standalone background process that keeps .falcon_cache.json warm
-so dashboards load instantly.
+"""Standalone daemon process for keeping the Falcon data cache warm.
 
-Usage:
-    python falcon_cache_daemon.py [poll_interval_seconds]
+ _______                        __ _______ __        __ __
+|   _   .----.-----.--.--.--.--|  |   _   |  |_.----|__|  |--.-----.
+|.  1___|   _|  _  |  |  |  |  _  |   1___|   _|   _|  |    <|  -__|
+|.  |___|__| |_____|________|_____|____   |____|__| |__|__|__|_____|
+|:  1   |                         |:  1   |
+|::.. . |   CROWDSTRIKE FALCON    |::.. . |    Falcon Digest
+`-------'                         `-------'
 
-Default poll interval is 300 seconds (5 minutes).
-Stop with Ctrl-C or SIGTERM.
+Falcon Digest — AI-Powered Falcon Security Dashboard
+
+Copyright 2024 CrowdStrike, Inc.
+
+MIT License — see LICENSE file for details.
 """
 
 import logging

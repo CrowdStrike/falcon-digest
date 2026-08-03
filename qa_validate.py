@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
-"""
-QA Validation Script — Falcon Digest New Tabs
-Validates all changes for Identity Protection, Cloud Security, and Exposure Management tabs.
+"""QA validation script for Falcon Digest tool responses.
+
+ _______                        __ _______ __        __ __
+|   _   .----.-----.--.--.--.--|  |   _   |  |_.----|__|  |--.-----.
+|.  1___|   _|  _  |  |  |  |  _  |   1___|   _|   _|  |    <|  -__|
+|.  |___|__| |_____|________|_____|____   |____|__| |__|__|__|_____|
+|:  1   |                         |:  1   |
+|::.. . |   CROWDSTRIKE FALCON    |::.. . |    Falcon Digest
+`-------'                         `-------'
+
+Falcon Digest — AI-Powered Falcon Security Dashboard
+
+Copyright 2024 CrowdStrike, Inc.
+
+MIT License — see LICENSE file for details.
 """
 
 import sys

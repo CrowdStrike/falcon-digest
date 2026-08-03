@@ -1,10 +1,18 @@
-"""Tests for FQL injection prevention.
+"""Tests for FQL injection prevention and input sanitization.
 
-The current MCP server embeds user-supplied values directly into FQL
-filter strings.  These tests verify that the tool handlers still behave
-correctly (return valid JSON / error messages) when given adversarial
-input, and they document the expected behaviour of the sanitize_fql_value
-helper once it is added to the codebase.
+ _______                        __ _______ __        __ __
+|   _   .----.-----.--.--.--.--|  |   _   |  |_.----|__|  |--.-----.
+|.  1___|   _|  _  |  |  |  |  _  |   1___|   _|   _|  |    <|  -__|
+|.  |___|__| |_____|________|_____|____   |____|__| |__|__|__|_____|
+|:  1   |                         |:  1   |
+|::.. . |   CROWDSTRIKE FALCON    |::.. . |    Falcon Digest
+`-------'                         `-------'
+
+Falcon Digest — AI-Powered Falcon Security Dashboard
+
+Copyright 2024 CrowdStrike, Inc.
+
+MIT License — see LICENSE file for details.
 """
 
 import pytest

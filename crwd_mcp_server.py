@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
-"""
-Falcon Digest — MCP Server
-Bird's-eye view across your CrowdStrike Falcon environment.
-13 tools, 4 resources, 5 prompts
+"""CrowdStrike Falcon MCP server with security operations tools.
+
+ _______                        __ _______ __        __ __
+|   _   .----.-----.--.--.--.--|  |   _   |  |_.----|__|  |--.-----.
+|.  1___|   _|  _  |  |  |  |  _  |   1___|   _|   _|  |    <|  -__|
+|.  |___|__| |_____|________|_____|____   |____|__| |__|__|__|_____|
+|:  1   |                         |:  1   |
+|::.. . |   CROWDSTRIKE FALCON    |::.. . |    Falcon Digest
+`-------'                         `-------'
+
+Falcon Digest — AI-Powered Falcon Security Dashboard
+
+Copyright 2024 CrowdStrike, Inc.
+
+MIT License — see LICENSE file for details.
 """
 
 from mcp.server.models import InitializationOptions

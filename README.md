@@ -1,6 +1,6 @@
-# CrowdStrike Falcon MCP Server
+# Building Local Dashboards with FalconPy using AI
 
-AI-powered security operations platform for CrowdStrike Falcon. Built on [FalconPy](https://github.com/CrowdStrike/falconpy) (CrowdStrike's official Python SDK) and the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). Includes an MCP server, an 11-tab Streamlit dashboard ("Falcon Digest"), and a CLI client for querying Falcon security data using natural language.
+Extract, visualize, and query your CrowdStrike Falcon security data locally. Built on [FalconPy](https://github.com/CrowdStrike/falconpy) (CrowdStrike's official Python SDK) with an 11-tab Streamlit dashboard, AI-powered natural language chat, and an MCP server for tool integration.
 
 ## Features
 
@@ -145,4 +145,4 @@ python -m pytest tests/test_cache.py -v
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+MIT License — see [LICENSE](LICENSE).

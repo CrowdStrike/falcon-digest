@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
-"""
-CrowdStrike MCP Client
-With background data caching for instant AI responses.
+"""CLI chat client with multi-provider LLM support for Falcon Digest.
+
+ _______                        __ _______ __        __ __
+|   _   .----.-----.--.--.--.--|  |   _   |  |_.----|__|  |--.-----.
+|.  1___|   _|  _  |  |  |  |  _  |   1___|   _|   _|  |    <|  -__|
+|.  |___|__| |_____|________|_____|____   |____|__| |__|__|__|_____|
+|:  1   |                         |:  1   |
+|::.. . |   CROWDSTRIKE FALCON    |::.. . |    Falcon Digest
+`-------'                         `-------'
+
+Falcon Digest — AI-Powered Falcon Security Dashboard
+
+Copyright 2024 CrowdStrike, Inc.
+
+MIT License — see LICENSE file for details.
 """
 
 import requests
@@ -183,7 +195,7 @@ def _default_model():
 
 
 def _to_openai_request(messages, tools, model, max_tokens):
-    """Convert Anthropic-format messages/tools to OpenAI Chat Completions format.
+    """Convert native message format to alternate provider chat completions format.
 
     Returns (url_path, payload) tuple.
     """
@@ -259,9 +271,9 @@ def _to_openai_request(messages, tools, model, max_tokens):
 
 
 def _from_openai_response(data):
-    """Normalize an OpenAI Chat Completions response to Anthropic format.
+    """Normalize an alternate provider response to native message format.
 
-    Returns a dict with 'stop_reason' and 'content' matching Anthropic's structure.
+    Returns a dict with 'stop_reason' and 'content' matching the native message structure.
     """
     choice = data.get("choices", [{}])[0]
     finish = choice.get("finish_reason", "stop")
@@ -432,7 +444,7 @@ You MUST NOT:
     if LLM_PROVIDER == "openai":
         url_path, payload = _to_openai_request(messages, tools, model, max_tokens=4096)
     else:
-        # Anthropic format (default)
+        # Native format (default)
         payload = {
             "model": model,
             "messages": messages,
