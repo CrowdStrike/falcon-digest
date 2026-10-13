@@ -36,7 +36,7 @@ from crwd_mcp_server import (
     get_identity_protection, get_cloud_security, get_exposure_management,
     validate_config, ConfigError
 )
-from mcp_api_client import call_llm, execute_tool, TOOL_DEFINITIONS
+from mcp_api_client import call_llm, execute_tool, validate_response, TOOL_DEFINITIONS
 from falcon_cache import cache as falcon_cache, parse_env_profiles, switch_env_profile
 
 load_dotenv()
@@ -622,25 +622,13 @@ _SCROLL_JS = """
 
 
 def stream_to_chat(container, text, label="Falcon Digest"):
-    """Stream text word-by-word into a chat container with typewriter effect."""
+    """Render assistant text into a chat container."""
     text = html.escape(text)
     with container:
-        placeholder = st.empty()
-        streamed = ""
-        words = text.split(' ')
-        for i, word in enumerate(words):
-            streamed += word + (' ' if i < len(words) - 1 else '')
-            placeholder.markdown(
-                f'<div class="chat-assistant"><strong>{label}:</strong> {streamed}▌</div>',
-                unsafe_allow_html=True
-            )
-            time.sleep(0.02)
-        # Final render without cursor
-        placeholder.markdown(
+        st.markdown(
             f'<div class="chat-assistant"><strong>{label}:</strong> {text}</div>',
             unsafe_allow_html=True
         )
-        # Auto-scroll to bottom
         components.html(_SCROLL_JS, height=0)
 
 
@@ -2823,65 +2811,73 @@ with tab_fql:
 # ============ TAB 11: AI CHAT ============
 
 with tab_chat:
-    st.subheader("Ask Falcon Digest")
-    st.caption("Powered by CrowdStrike Falcon Platform with full MCP tool access")
 
-    if "chat_messages" not in st.session_state:
-        st.session_state.chat_messages = []
+    @st.fragment
+    def _chat_fragment():
+        st.subheader("Ask Falcon Digest")
+        st.caption("Powered by CrowdStrike Falcon Platform with full MCP tool access")
 
-    st.markdown("**Quick Actions**")
-    prompt_cols = st.columns(5)
-    guided_prompts = [
-        "Triage critical cases from the last 24h",
-        "Show my security posture overview",
-        "What are the top vulnerabilities I should patch?",
-        "Hunt for suspicious IOCs in the last 7 days",
-        "Generate an executive security briefing"
-    ]
-    for idx, (col, prompt_text) in enumerate(zip(prompt_cols, guided_prompts)):
-        with col:
-            if st.button(prompt_text, key=f"guided_{idx}", width="stretch"):
-                st.session_state.chat_pending = prompt_text
+        if "chat_messages" not in st.session_state:
+            st.session_state.chat_messages = []
 
-    # Fixed-height scrollable chat window
-    chat_container = st.container(height=500)
-    with chat_container:
-        if not st.session_state.chat_messages:
-            st.markdown(
-                '<div style="text-align:center; color:#9CA3AF; padding:40px 0;">'
-                'Ask a question or use a Quick Action above to get started.</div>',
-                unsafe_allow_html=True
-            )
-        for msg in st.session_state.chat_messages:
-            if msg["role"] == "user":
-                st.markdown(f'<div class="chat-user"><strong>You:</strong> {html.escape(msg["content"])}</div>', unsafe_allow_html=True)
-            elif msg["role"] == "assistant":
-                st.markdown(f'<div class="chat-assistant"><strong>Falcon Digest:</strong> {html.escape(msg["content"])}</div>', unsafe_allow_html=True)
-            elif msg["role"] == "tool_call":
-                with st.expander(f"Tool: {msg['tool_name']}", expanded=False):
-                    st.json(msg.get("input", {}))
-                    if msg.get("result"):
-                        parsed = safe_json_parse(msg["result"])
-                        if parsed:
-                            st.json(parsed)
-                        else:
-                            st.text(msg["result"])
+        st.markdown("**Quick Actions**")
+        prompt_cols = st.columns(5)
+        guided_prompts = [
+            "Triage critical cases from the last 24h",
+            "Show my security posture overview",
+            "What are the top vulnerabilities I should patch?",
+            "Hunt for suspicious IOCs in the last 7 days",
+            "Generate an executive security briefing"
+        ]
+        for idx, (col, prompt_text) in enumerate(zip(prompt_cols, guided_prompts)):
+            with col:
+                if st.button(prompt_text, key=f"guided_{idx}", width="stretch"):
+                    st.session_state.chat_pending = prompt_text
 
-        # Auto-scroll is handled after new messages are sent (below)
-
-    chat_input = st.chat_input("Ask about your security environment...")
-    pending_msg = st.session_state.pop("chat_pending", None)
-    active_input = pending_msg or chat_input
-
-    if active_input:
-        st.session_state.chat_messages.append({"role": "user", "content": active_input})
+        # Fixed-height scrollable chat window
+        chat_container = st.container(height=500)
         with chat_container:
-            st.markdown(f'<div class="chat-user"><strong>You:</strong> {html.escape(active_input)}</div>', unsafe_allow_html=True)
-            components.html(_SCROLL_JS, height=0)
-        api_messages = [{"role": "user", "content": active_input}]
+            if not st.session_state.chat_messages:
+                st.markdown(
+                    '<div style="text-align:center; color:#9CA3AF; padding:40px 0;">'
+                    'Ask a question or use a Quick Action above to get started.</div>',
+                    unsafe_allow_html=True
+                )
+            for msg in st.session_state.chat_messages:
+                if msg["role"] == "user":
+                    st.markdown(f'<div class="chat-user"><strong>You:</strong> {html.escape(msg["content"])}</div>', unsafe_allow_html=True)
+                elif msg["role"] == "assistant":
+                    st.markdown(f'<div class="chat-assistant"><strong>Falcon Digest:</strong> {html.escape(msg["content"])}</div>', unsafe_allow_html=True)
+                elif msg["role"] == "tool_call":
+                    with st.expander(f"Tool: {msg['tool_name']}", expanded=False):
+                        st.json(msg.get("input", {}))
+                        if msg.get("result"):
+                            parsed = safe_json_parse(msg["result"])
+                            if parsed:
+                                st.json(parsed)
+                            else:
+                                st.text(msg["result"])
 
-        try:
-            with st.spinner("Falcon Digest is thinking..."):
+        chat_input = st.chat_input("Ask about your security environment...")
+        pending_msg = st.session_state.pop("chat_pending", None)
+        active_input = pending_msg or chat_input
+
+        if active_input:
+            st.session_state.chat_messages.append({"role": "user", "content": active_input})
+            with chat_container:
+                st.markdown(f'<div class="chat-user"><strong>You:</strong> {html.escape(active_input)}</div>', unsafe_allow_html=True)
+                components.html(_SCROLL_JS, height=0)
+            api_messages = [{"role": "user", "content": active_input}]
+
+            thinking_ph = None
+            try:
+                with chat_container:
+                    thinking_ph = st.empty()
+                    thinking_ph.markdown(
+                        '<div class="chat-assistant" style="color:#9CA3AF;">'
+                        '<strong>Falcon Digest:</strong> Thinking...</div>',
+                        unsafe_allow_html=True
+                    )
                 response = call_llm(api_messages, TOOL_DEFINITIONS)
 
                 max_iterations = 10
@@ -2904,28 +2900,34 @@ with tab_chat:
                     api_messages.append({"role": "user", "content": tool_results})
                     response = call_llm(api_messages, TOOL_DEFINITIONS)
 
-            # Extract final text outside spinner so overlay is gone during streaming
-            final_text = ""
-            for block in response.get("content", []):
-                if block.get("type") == "text":
-                    final_text += block.get("text", "")
-            if final_text:
-                stream_to_chat(chat_container, final_text)
-                st.session_state.chat_messages.append({"role": "assistant", "content": final_text})
+                thinking_ph.empty()
 
-        except Exception as e:
-            _logger.error("LLM error: %s", e, exc_info=True)
-            err_msg = "Sorry, I'm having trouble connecting to Falcon Digest right now. Please try again in a moment."
-            stream_to_chat(chat_container, err_msg)
-            st.session_state.chat_messages.append({
-                "role": "assistant",
-                "content": err_msg
-            })
+                final_text = ""
+                for block in response.get("content", []):
+                    if block.get("type") == "text":
+                        final_text += block.get("text", "")
+                if final_text:
+                    final_text = validate_response(final_text)
+                    stream_to_chat(chat_container, final_text)
+                    st.session_state.chat_messages.append({"role": "assistant", "content": final_text})
 
-    if st.session_state.chat_messages:
-        if st.button("Clear Chat", key="clear_chat"):
+            except Exception as e:
+                _logger.error("LLM error: %s", e, exc_info=True)
+                if thinking_ph:
+                    thinking_ph.empty()
+                err_msg = "Sorry, I'm having trouble connecting to Falcon Digest right now. Please try again in a moment."
+                stream_to_chat(chat_container, err_msg)
+                st.session_state.chat_messages.append({
+                    "role": "assistant",
+                    "content": err_msg
+                })
+
+        if st.session_state.chat_messages:
+            if st.button("Clear Chat", key="clear_chat"):
                 st.session_state.chat_messages = []
                 st.rerun()
+
+    _chat_fragment()
 
 # ============ FOOTER ============
 
