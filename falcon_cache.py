@@ -69,8 +69,8 @@ class FalconCache:
         self._lock = threading.Lock()
         self._polling_thread = None
         self._running = False
-        self.poll_interval = 300  # seconds between refreshes
-        self.ttl = 300            # seconds before entry is stale
+        self.poll_interval = 300   # seconds between refreshes
+        self.ttl = 86400           # seconds before entry is stale (24h — supports offline use)
         self._last_refresh = None
         self._refresh_count = 0
         self._errors = []
@@ -87,7 +87,7 @@ class FalconCache:
 
     # ---------- lifecycle ----------
 
-    def start(self, poll_interval: int = 300, ttl: int = 300):
+    def start(self, poll_interval: int = 300, ttl: int = 86400):
         """Start background polling. Safe to call multiple times."""
         # If thread died but _running is still True, reset it
         if self._running and self._polling_thread and not self._polling_thread.is_alive():
@@ -538,6 +538,56 @@ class FalconCache:
             total = data.get("total_edge_types", 0)
             lines.append(f"## ThreatGraph ({total} edge types available)")
             lines.append("  IOC lookup supports: domain, ipv4, ipv6, md5, sha1, sha256")
+            lines.append("")
+
+        # Top Affected Hosts (cross-referenced from all data sources)
+        host_issues: dict[str, dict] = {}
+        for sev_key in ["alerts_critical", "alerts_high"]:
+            sdata = self.get_parsed(sev_key)
+            if sdata and isinstance(sdata, dict):
+                for a in sdata.get("alerts", []):
+                    h = a.get("hostname") or "N/A"
+                    if h == "N/A":
+                        continue
+                    host_issues.setdefault(h, {"alerts": 0, "vulns": 0, "detections": 0, "platform": ""})
+                    host_issues[h]["alerts"] += 1
+        ddata = self.get_parsed("detections_recent")
+        if ddata and isinstance(ddata, dict):
+            for d in ddata.get("detections", []):
+                h = d.get("hostname") or "N/A"
+                if h == "N/A":
+                    continue
+                host_issues.setdefault(h, {"alerts": 0, "vulns": 0, "detections": 0, "platform": ""})
+                host_issues[h]["detections"] += 1
+        vdata = self.get_parsed("vulnerabilities_critical")
+        if vdata and isinstance(vdata, dict):
+            for v in vdata.get("vulnerabilities", []):
+                h = v.get("hostname") or "N/A"
+                if h == "N/A":
+                    continue
+                host_issues.setdefault(h, {"alerts": 0, "vulns": 0, "detections": 0, "platform": ""})
+                host_issues[h]["vulns"] += 1
+                if v.get("os_version") and not host_issues[h]["platform"]:
+                    os_v = v["os_version"].lower()
+                    if "windows" in os_v:
+                        host_issues[h]["platform"] = "Windows"
+                    elif "linux" in os_v or "ubuntu" in os_v or "centos" in os_v or "rhel" in os_v:
+                        host_issues[h]["platform"] = "Linux"
+                    elif "mac" in os_v or "darwin" in os_v:
+                        host_issues[h]["platform"] = "Mac"
+        if host_issues:
+            ranked = sorted(host_issues.items(), key=lambda x: sum([x[1]["alerts"], x[1]["vulns"], x[1]["detections"]]), reverse=True)
+            lines.append(f"## Top Affected Hosts ({len(ranked)} hosts with issues)")
+            for h, counts in ranked[:10]:
+                parts = []
+                if counts["alerts"]:
+                    parts.append(f"{counts['alerts']} alerts")
+                if counts["detections"]:
+                    parts.append(f"{counts['detections']} detections")
+                if counts["vulns"]:
+                    parts.append(f"{counts['vulns']} critical vulns")
+                plat = f" [{counts['platform']}]" if counts["platform"] else ""
+                lines.append(f"  - {h}{plat}: {', '.join(parts)}")
             lines.append("")
 
         # Identity Protection
