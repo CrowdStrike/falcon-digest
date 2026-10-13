@@ -23,6 +23,8 @@ import json
 import asyncio
 import logging
 import time
+import re
+from datetime import datetime, timezone
 from crwd_mcp_server import (
     search_alerts, get_host_details, test_fql_filter, list_available_products,
     search_cases, search_detections, search_vulnerabilities,
@@ -340,6 +342,19 @@ def call_llm(messages, tools=None, system_context=None):
     if system_context is None and falcon_cache.is_running:
         system_context = falcon_cache.build_context_summary()
 
+    # Compute cache age for the model to report
+    cache_age_note = ""
+    if falcon_cache.is_running and falcon_cache._last_refresh:
+        age_sec = (datetime.now(tz=timezone.utc) - falcon_cache._last_refresh).total_seconds()
+        if age_sec < 120:
+            cache_age_note = "Cache refreshed just now."
+        elif age_sec < 3600:
+            cache_age_note = f"Cache is {int(age_sec / 60)} minutes old."
+        elif age_sec < 86400:
+            cache_age_note = f"Cache is {int(age_sec / 3600)} hours old."
+        else:
+            cache_age_note = f"Cache is {int(age_sec / 86400)} days old."
+
     # Prepend cached context as a message pair so the AI has data upfront.
     # We avoid using the "system" payload field since some endpoints may not support it.
     if system_context:
@@ -347,7 +362,8 @@ def call_llm(messages, tools=None, system_context=None):
             {"role": "user", "content": f"""[Security Data Context]
 {system_context}
 
-Use this pre-fetched data to answer questions when possible. Use tools only when you need fresher data, different filters, or information not covered above.
+IMPORTANT: Answer ALL questions using ONLY the cached data above. {cache_age_note} If data seems stale, mention the cache age in your answer. Do NOT call tools unless the user explicitly asks for live/fresh data.
+If the cached data does not contain enough detail to fully answer a question, answer with what IS available and be specific about what's missing (e.g., "The cache has 201 Linux hosts but no per-host alert breakdown. Here's what I can tell you from the data I have: ..."). Never give a vague non-answer.
 
 # Identity & Boundaries
 
@@ -463,7 +479,7 @@ You MUST NOT:
                 f"{LLM_ENDPOINT}{url_path}",
                 headers=headers,
                 json=payload,
-                timeout=60
+                timeout=300
             )
             if response.status_code >= 500 and attempt < MAX_RETRIES - 1:
                 logger.warning(f"LLM returned {response.status_code}, retrying in {RETRY_BACKOFF[attempt]}s...")
@@ -485,6 +501,99 @@ You MUST NOT:
         except requests.exceptions.HTTPError:
             raise
     raise last_error
+
+
+# ============ RESPONSE GROUNDING VALIDATION ============
+
+def _extract_known_identifiers() -> dict:
+    """Extract all known identifiers from the cache for validation."""
+    known = {"hostnames": set(), "cves": set(), "ips": set(), "case_ids": set()}
+    if not falcon_cache.is_running:
+        return known
+
+    posture = falcon_cache.get_parsed("security_posture")
+    if posture and isinstance(posture, dict):
+        for host in posture.get("hosts", {}).get("details", []):
+            if host.get("hostname"):
+                known["hostnames"].add(host["hostname"].lower())
+            for ip_field in ("local_ip", "external_ip"):
+                if host.get(ip_field):
+                    known["ips"].add(host[ip_field])
+
+    for key in ("vulnerabilities_critical",):
+        data = falcon_cache.get_parsed(key)
+        if data and isinstance(data, dict):
+            for v in data.get("vulnerabilities", []):
+                if v.get("cve_id"):
+                    known["cves"].add(v["cve_id"].upper())
+                if v.get("hostname"):
+                    known["hostnames"].add(v["hostname"].lower())
+
+    for key in ("alerts_critical", "alerts_high", "alerts_all"):
+        data = falcon_cache.get_parsed(key)
+        if data and isinstance(data, dict):
+            for a in data.get("alerts", []):
+                if a.get("hostname"):
+                    known["hostnames"].add(a["hostname"].lower())
+
+    for key in ("detections_recent",):
+        data = falcon_cache.get_parsed(key)
+        if data and isinstance(data, dict):
+            for d in data.get("detections", []):
+                if d.get("hostname"):
+                    known["hostnames"].add(d["hostname"].lower())
+
+    data = falcon_cache.get_parsed("cases_recent")
+    if data and isinstance(data, dict):
+        for c in data.get("cases", []):
+            if c.get("id"):
+                known["case_ids"].add(str(c["id"]))
+
+    data = falcon_cache.get_parsed("exposure_management")
+    if data and isinstance(data, dict):
+        for a in data.get("assets", []):
+            if a.get("name"):
+                known["hostnames"].add(a["name"].lower())
+
+    data = falcon_cache.get_parsed("identity_protection")
+    if data and isinstance(data, dict):
+        for r in data.get("risky_entities", []):
+            if r.get("display_name"):
+                known["hostnames"].add(r["display_name"].lower())
+
+    return known
+
+
+def validate_response(text: str) -> str:
+    """Validate LLM response against cached data. Flag or remove hallucinated identifiers."""
+    if not falcon_cache.is_running:
+        return text
+
+    known = _extract_known_identifiers()
+    warnings = []
+
+    cve_pattern = re.compile(r'CVE-\d{4}-\d{4,}', re.IGNORECASE)
+    found_cves = cve_pattern.findall(text)
+    if found_cves and known["cves"]:
+        for cve in found_cves:
+            if cve.upper() not in known["cves"]:
+                warnings.append(f"{cve} not found in Falcon data")
+                text = text.replace(cve, f"~~{cve}~~")
+
+    ip_pattern = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+    found_ips = ip_pattern.findall(text)
+    if found_ips and known["ips"]:
+        for ip in found_ips:
+            if ip not in known["ips"] and not ip.startswith("0.") and ip != "0.0.0.0":
+                warnings.append(f"IP {ip} not found in Falcon data")
+                text = text.replace(ip, f"~~{ip}~~")
+
+    if warnings:
+        disclaimer = "\n\n---\n⚠️ **Grounding check**: " + "; ".join(warnings) + ". Struck-through items could not be verified against cached Falcon data."
+        text += disclaimer
+        logger.warning("Grounding validation flagged: %s", "; ".join(warnings))
+
+    return text
 
 
 def execute_tool(tool_name: str, tool_input: dict) -> str:
@@ -606,6 +715,7 @@ def chat(user_message: str):
         if block.get("type") == "text":
             final_text += block.get("text", "")
 
+    final_text = validate_response(final_text)
     print(f"\n{final_text}\n")
     return final_text
 
