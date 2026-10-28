@@ -18,7 +18,15 @@ MIT License — see LICENSE file for details.
 import pytest
 import json
 import os
+import tempfile
 from unittest.mock import MagicMock, patch, AsyncMock
+
+# Isolate all local state BEFORE any project module is imported: config, key,
+# users and cache files go to a throwaway directory, and the OS keychain is
+# replaced with a backend that always fails, so tests never write real key
+# material into the repo or the developer's login keychain.
+os.environ["FALCON_DIGEST_HOME"] = tempfile.mkdtemp(prefix="falcon-digest-tests-")
+os.environ["PYTHON_KEYRING_BACKEND"] = "keyring.backends.fail.Keyring"
 
 
 @pytest.fixture

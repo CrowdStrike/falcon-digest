@@ -21,12 +21,37 @@ import json
 import logging
 import os
 import secrets
+import threading
+import time
 from datetime import datetime, timezone
 
-logger = logging.getLogger(__name__)
+from falcon_secrets import APP_DIR, write_private_file
 
-USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".falcon_users.json")
+logger = logging.getLogger("falcon_mcp.auth")
+
+USERS_FILE = os.path.join(APP_DIR, ".falcon_users.json")
+ROLES = ("admin", "viewer")
 _PBKDF2_ITERATIONS = 600_000
+
+# Failed-login throttling (process-wide, keyed by normalized username)
+_MAX_FREE_ATTEMPTS = 5
+_LOCKOUT_BASE_SECONDS = 30
+_LOCKOUT_MAX_SECONDS = 900
+_failed_logins: dict[str, tuple[int, float]] = {}
+_failed_lock = threading.Lock()
+
+# Verified against when the username is unknown, so both paths cost one PBKDF2 run
+_DUMMY_SALT = os.urandom(32)
+_DUMMY_HASH = hashlib.pbkdf2_hmac("sha256", b"dummy-password", _DUMMY_SALT, _PBKDF2_ITERATIONS).hex()
+
+
+class UsersFileError(Exception):
+    """Raised when the users file exists but cannot be loaded or written."""
+
+
+def normalize_username(username: str) -> str:
+    """Return the canonical (stripped, lowercase) form of a username."""
+    return (username or "").strip().lower()
 
 
 def _hash_password(password: str, salt: bytes | None = None) -> tuple[str, str]:
@@ -42,52 +67,114 @@ def _verify_password(password: str, stored_hash: str, salt_hex: str) -> bool:
     return hmac.compare_digest(dk.hex(), stored_hash)
 
 
+def lockout_remaining(username: str) -> float:
+    """Return seconds until ``username`` may attempt to log in again (0 if not locked)."""
+    with _failed_lock:
+        count, last = _failed_logins.get(normalize_username(username), (0, 0.0))
+    if count < _MAX_FREE_ATTEMPTS:
+        return 0.0
+    delay = min(_LOCKOUT_BASE_SECONDS * 2 ** (count - _MAX_FREE_ATTEMPTS), _LOCKOUT_MAX_SECONDS)
+    return max(0.0, last + delay - time.time())
+
+
+def _record_failure(username: str) -> None:
+    with _failed_lock:
+        count, _ = _failed_logins.get(username, (0, 0.0))
+        _failed_logins[username] = (count + 1, time.time())
+
+
+def _clear_failures(username: str) -> None:
+    with _failed_lock:
+        _failed_logins.pop(username, None)
+
+
 class UserManager:
+    """Manage dashboard users stored in a local JSON file with PBKDF2 password hashes.
+
+    If the users file exists but cannot be read or parsed, ``load_error`` is
+    set and the manager fails closed: ``has_users()`` returns True and all
+    writes are refused, so a damaged file never reopens first-run setup.
+    """
 
     def __init__(self, path: str = USERS_FILE):
         self._path = path
         self._users: dict = {}
+        self.load_error: str | None = None
         self._load()
 
-    def _load(self):
-        if not os.path.isfile(self._path):
+    def _load(self) -> None:
+        self.load_error = None
+        if not os.path.exists(self._path):
             self._users = {}
             return
         try:
             with open(self._path, "r") as f:
                 data = json.load(f)
-            self._users = data.get("users", {})
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error(f"Failed to load users file: {e}")
+            users = data.get("users") if isinstance(data, dict) else None
+            if not isinstance(users, dict):
+                raise ValueError("missing 'users' object")
+            self._users = users
+        except (ValueError, OSError) as e:
+            self.load_error = f"Cannot read users file {self._path}: {e}"
+            logger.error(self.load_error)
             self._users = {}
 
-    def _save(self):
-        payload = {"users": self._users}
-        tmp_path = self._path + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(payload, f, indent=2)
-        os.replace(tmp_path, self._path)
-        os.chmod(self._path, 0o600)
+    def _save(self) -> None:
+        if self.load_error:
+            raise UsersFileError(self.load_error)
+        write_private_file(self._path, json.dumps({"users": self._users}, indent=2).encode())
 
     def has_users(self) -> bool:
-        return len(self._users) > 0
+        """Return True if any user exists (or the users file is unreadable)."""
+        return bool(self._users) or self.load_error is not None
 
     def list_users(self) -> list[dict]:
+        """List users without password material."""
         return [
             {"username": u, "role": info.get("role", "viewer"), "created": info.get("created", "")}
             for u, info in self._users.items()
         ]
 
-    def authenticate(self, username: str, password: str) -> dict | None:
+    def get_user(self, username: str) -> dict | None:
+        """Return ``{"username", "role"}`` for an existing user, else None."""
+        username = normalize_username(username)
         user = self._users.get(username)
         if not user:
             return None
-        if _verify_password(password, user["password_hash"], user["salt"]):
-            return {"username": username, "role": user.get("role", "viewer")}
-        return None
+        return {"username": username, "role": user.get("role", "viewer")}
+
+    def authenticate(self, username: str, password: str) -> dict | None:
+        """Verify credentials.
+
+        Unknown usernames are checked against a dummy hash so response time
+        doesn't reveal which usernames exist. Repeated failures lock the
+        username out with exponential backoff (see ``lockout_remaining``).
+
+        Returns:
+            ``{"username", "role"}`` on success, else None.
+        """
+        username = normalize_username(username)
+        if lockout_remaining(username) > 0:
+            return None
+        user = self._users.get(username)
+        if user:
+            ok = _verify_password(password or "", user["password_hash"], user["salt"])
+        else:
+            _verify_password(password or "", _DUMMY_HASH, _DUMMY_SALT.hex())
+            ok = False
+        if not ok:
+            _record_failure(username)
+            return None
+        _clear_failures(username)
+        return {"username": username, "role": user.get("role", "viewer")}
 
     def add_user(self, username: str, password: str, role: str = "viewer") -> str | None:
-        username = username.strip().lower()
+        """Create a user.
+
+        Returns:
+            An error message, or None on success.
+        """
+        username = normalize_username(username)
         if not username or not password:
             return "Username and password are required."
         if len(username) < 3:
@@ -96,7 +183,7 @@ class UserManager:
             return "Password must be at least 8 characters."
         if username in self._users:
             return f"User '{username}' already exists."
-        if role not in ("admin", "viewer"):
+        if role not in ROLES:
             return "Role must be 'admin' or 'viewer'."
         pw_hash, salt = _hash_password(password)
         self._users[username] = {
@@ -109,6 +196,12 @@ class UserManager:
         return None
 
     def remove_user(self, username: str) -> str | None:
+        """Delete a user. The last admin can't be removed.
+
+        Returns:
+            An error message, or None on success.
+        """
+        username = normalize_username(username)
         if username not in self._users:
             return f"User '{username}' not found."
         admins = [u for u, info in self._users.items() if info.get("role") == "admin"]
@@ -119,6 +212,12 @@ class UserManager:
         return None
 
     def change_password(self, username: str, new_password: str) -> str | None:
+        """Set a new password.
+
+        Returns:
+            An error message, or None on success.
+        """
+        username = normalize_username(username)
         if username not in self._users:
             return f"User '{username}' not found."
         if len(new_password) < 8:
@@ -130,9 +229,15 @@ class UserManager:
         return None
 
     def change_role(self, username: str, new_role: str) -> str | None:
+        """Change a user's role. The last admin can't be demoted.
+
+        Returns:
+            An error message, or None on success.
+        """
+        username = normalize_username(username)
         if username not in self._users:
             return f"User '{username}' not found."
-        if new_role not in ("admin", "viewer"):
+        if new_role not in ROLES:
             return "Role must be 'admin' or 'viewer'."
         if self._users[username].get("role") == "admin" and new_role == "viewer":
             admins = [u for u, info in self._users.items() if info.get("role") == "admin"]
@@ -142,24 +247,43 @@ class UserManager:
         self._save()
         return None
 
-    def generate_setup_token(self) -> str:
-        token = secrets.token_urlsafe(32)
-        meta_path = self._path + ".setup"
-        with open(meta_path, "w") as f:
-            json.dump({"token": token, "created": datetime.now(timezone.utc).isoformat()}, f)
-        os.chmod(meta_path, 0o600)
+    # ---- First-run setup token ----
+
+    @property
+    def setup_token_path(self) -> str:
+        """Path of the one-time setup token file."""
+        return self._path + ".setup"
+
+    def get_or_create_setup_token(self) -> str:
+        """Return the pending setup token, creating it if none exists.
+
+        The token gates creation of the first admin account so that whoever
+        happens to reach the dashboard first can't claim it.
+        """
+        try:
+            with open(self.setup_token_path, "r") as f:
+                token = json.load(f).get("token", "")
+            if token:
+                return token
+        except (OSError, ValueError):
+            pass
+        token = secrets.token_urlsafe(24)
+        payload = {"token": token, "created": datetime.now(timezone.utc).isoformat()}
+        write_private_file(self.setup_token_path, json.dumps(payload).encode())
         return token
 
     def verify_setup_token(self, token: str) -> bool:
-        meta_path = self._path + ".setup"
-        if not os.path.isfile(meta_path):
-            return False
+        """Check a setup token in constant time."""
         try:
-            with open(meta_path, "r") as f:
-                data = json.load(f)
-            valid = hmac.compare_digest(data.get("token", ""), token)
-            if valid:
-                os.remove(meta_path)
-            return valid
-        except (json.JSONDecodeError, OSError):
+            with open(self.setup_token_path, "r") as f:
+                expected = json.load(f).get("token", "")
+        except (OSError, ValueError):
             return False
+        return bool(expected) and hmac.compare_digest(expected, (token or "").strip())
+
+    def consume_setup_token(self) -> None:
+        """Delete the setup token after the first admin is created."""
+        try:
+            os.remove(self.setup_token_path)
+        except OSError:
+            pass

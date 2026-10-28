@@ -1,5 +1,6 @@
 # Environment
 .env
+.env.migrated
 venv/
 __pycache__/
 *.pyc
@@ -17,6 +18,7 @@ __pycache__/
 .falcon_config.enc
 .falcon_config.enc.tmp
 .falcon_config.key
+.falcon_config.key.tmp
 
 # IDE
 .idea/
@@ -33,11 +35,11 @@ __pycache__/
 .falcon_cache_backups/
 
 # Legacy test files (integration, require live API)
-test_auth.py
-test_genai_hub.py
-test_mcp.py
-test_ngsiem_repos.py
-test_ngsiem_size.py
+/test_auth.py
+/test_genai_hub.py
+/test_mcp.py
+/test_ngsiem_repos.py
+/test_ngsiem_size.py
 
 # Claude Code session data
 .claude/

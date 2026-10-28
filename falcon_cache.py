@@ -35,16 +35,31 @@ from crwd_mcp_server import (
     get_identity_protection, get_cloud_security, get_exposure_management,
     get_ngsiem_ingestion
 )
-from falcon_secrets import encrypt_cache, decrypt_cache
+from falcon_secrets import APP_DIR, encrypt_cache, decrypt_cache, refresh_env_from_store, write_private_file
 
 
-CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".falcon_cache.json")
-CACHE_BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".falcon_cache_backups")
+CACHE_FILE = os.path.join(APP_DIR, ".falcon_cache.json")
+CACHE_BACKUP_DIR = os.path.join(APP_DIR, ".falcon_cache_backups")
 
-_PATH_RE = re.compile(r'(/[\w./-]+){3,}')
+# Filesystem paths: POSIX (2+ segments, not part of a URL) and Windows drive paths
+_POSIX_PATH_RE = re.compile(r"(?<![\w:/.])(?:/[\w.\-]+){2,}/?")
+_WINDOWS_PATH_RE = re.compile(r"\b[A-Za-z]:\\(?:[^\\\s'\"]+\\)*[^\\\s'\"]*")
 
-def _sanitize_error_msg(msg: str, max_len: int = 200) -> str:
-    sanitized = _PATH_RE.sub("[path]", str(msg))
+
+def sanitize_error(msg, max_len: int = 200) -> str:
+    """Strip filesystem paths from an error message and truncate it for display.
+
+    URLs are left intact; only local POSIX/Windows paths are replaced.
+
+    Args:
+        msg: Error message or exception.
+        max_len: Maximum length of the returned string.
+
+    Returns:
+        The sanitized message.
+    """
+    sanitized = _WINDOWS_PATH_RE.sub("[path]", str(msg))
+    sanitized = _POSIX_PATH_RE.sub("[path]", sanitized)
     return sanitized[:max_len] + "…" if len(sanitized) > max_len else sanitized
 
 
@@ -78,7 +93,7 @@ class FalconCache:
         self._polling_thread = None
         self._running = False
         self.poll_interval = 300   # seconds between refreshes
-        self.ttl = 86400           # seconds before entry is stale (24h — supports offline use)
+        self.ttl = 86400           # seconds before entry is stale; callers normally override via start()
         self._last_refresh = None
         self._refresh_count = 0
         self._errors = []
@@ -191,9 +206,9 @@ class FalconCache:
         while self._running:
             time.sleep(self.poll_interval)
             if self._running:
-                # Check for CID change before each refresh
-                from dotenv import load_dotenv
-                load_dotenv(override=True)
+                # Pick up config changes (e.g. a profile switch saved by another
+                # process), then check for a CID change before refreshing
+                refresh_env_from_store()
                 self.check_cid_change()
                 self._refresh_all()
 
@@ -260,12 +275,12 @@ class FalconCache:
                 for future in as_completed(futures):
                     key, result = future.result()
                     if isinstance(result, Exception):
-                        self._errors.append(f"{key}: {_sanitize_error_msg(result)}")
+                        self._errors.append(f"{key}: {sanitize_error(result)}")
                         logger.error(f"Error fetching {key}: {result}")
                         self._refresh_current[key] = "error"
                         with self._lock:
                             self._cache[key] = {
-                                "data": json.dumps({"error": _sanitize_error_msg(result)}),
+                                "data": json.dumps({"error": sanitize_error(result)}),
                                 "fetched_at": now_ts,
                             }
                     else:
@@ -299,16 +314,12 @@ class FalconCache:
                 "entries": snapshot,
             }
             encrypted = encrypt_cache(payload)
-            tmp_path = CACHE_FILE + ".tmp"
-            if encrypted:
-                with open(tmp_path, "wb") as f:
-                    f.write(encrypted)
-            else:
-                with open(tmp_path, "w") as f:
-                    json.dump(payload, f)
-            os.replace(tmp_path, CACHE_FILE)
-            os.chmod(CACHE_FILE, 0o600)
-            logger.debug(f"Cache saved to {CACHE_FILE} ({len(snapshot)} entries, encrypted={encrypted is not None})")
+            if encrypted is None:
+                # Never fall back to plaintext on disk
+                logger.error("Cache encryption failed — skipping cache persistence")
+                return
+            write_private_file(CACHE_FILE, encrypted)
+            logger.debug(f"Cache saved to {CACHE_FILE} ({len(snapshot)} entries)")
         except Exception as e:
             logger.error(f"Failed to save cache file: {e}")
 
@@ -687,175 +698,6 @@ class FalconCache:
         lines.append("=== END CACHED DATA ===")
 
         return "\n".join(lines)
-
-
-# ============ CID Profile Management ============
-
-ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-
-
-def parse_env_profiles() -> list[dict]:
-    """Parse .env file and extract CID credential profiles.
-
-    The .env uses a comment/uncomment pattern:
-        #profile_name
-        #FALCON_CLIENT_ID=xxx    (commented = inactive)
-        #FALCON_CLIENT_SECRET=xxx
-        #FALCON_BASE_URL=xxx
-
-    Active profile has uncommented FALCON_* lines.
-
-    Returns list of dicts: [{"name": str, "client_id": str, "base_url": str, "active": bool}]
-    """
-    if not os.path.exists(ENV_FILE):
-        return []
-
-    with open(ENV_FILE, "r") as f:
-        lines = f.readlines()
-
-    profiles = []
-    i = 0
-    while i < len(lines):
-        line = lines[i].rstrip()
-
-        # Look for a profile header comment: starts with # but is NOT a commented-out var
-        # and does not mention LLM config (which is not a CID profile)
-        if (line.startswith("#") and
-                not line.startswith("#FALCON_") and
-                not line.startswith("#LLM_") and
-                "llm_endpoint" not in line.lower() and "llm_api_key" not in line.lower() and
-                line.strip() and
-                "=" not in line.split()[0]):
-            profile_name = line.lstrip("#").strip()
-            if not profile_name:
-                i += 1
-                continue
-
-            # Scan ahead (up to 8 lines) for FALCON_CLIENT_ID/BASE_URL
-            # Secrets are not read here — they live in OS keychain
-            client_id = None
-            base_url = None
-            active = None
-            line_start = i
-            j = i + 1
-            while j < len(lines) and j <= i + 8:
-                l = lines[j].rstrip()
-                if "FALCON_CLIENT_ID=" in l:
-                    is_commented = l.lstrip().startswith("#")
-                    val = l.lstrip("#").split("=", 1)[1].strip()
-                    client_id = val
-                    if active is None:
-                        active = not is_commented
-                elif "FALCON_CLIENT_SECRET=" in l:
-                    pass
-                elif "FALCON_BASE_URL=" in l:
-                    is_commented = l.lstrip().startswith("#")
-                    val = l.lstrip("#").split("=", 1)[1].strip()
-                    base_url = val
-                elif l.strip() == "" or "LLM_ENDPOINT" in l or "LLM_API_KEY" in l:
-                    # Skip empty lines and LLM config lines
-                    j += 1
-                    continue
-                elif l.startswith("#") and "=" not in l:
-                    # Next profile header — stop scanning
-                    break
-                j += 1
-
-            if client_id:
-                profiles.append({
-                    "name": profile_name,
-                    "client_id": client_id,
-                    "client_id_short": client_id[-8:] if len(client_id) >= 8 else client_id,
-                    "base_url": base_url or "https://api.crowdstrike.com",
-                    "active": bool(active),
-                    "line_start": line_start,
-                    "line_end": j - 1,
-                })
-            i = j
-        else:
-            i += 1
-
-    return profiles
-
-
-def switch_env_profile(target_name: str) -> bool:
-    """Rewrite .env to activate the profile with `target_name` and comment out others.
-
-    Secrets are loaded from OS keychain when available. Non-secret config
-    (client ID, base URL) is toggled via comment/uncomment in .env.
-    Returns True if profile was switched successfully.
-    """
-    from falcon_secrets import inject_secret_to_env, keyring_available
-
-    if not os.path.exists(ENV_FILE):
-        return False
-
-    with open(ENV_FILE, "r") as f:
-        lines = f.readlines()
-
-    profiles = parse_env_profiles()
-    if not profiles:
-        return False
-
-    target = None
-    for p in profiles:
-        if p["name"] == target_name:
-            target = p
-            break
-    if not target:
-        return False
-
-    # Rewrite the file: comment out all FALCON_* lines, then uncomment the target profile's
-    new_lines = []
-    in_profile = None
-    for i, line in enumerate(lines):
-        stripped = line.rstrip()
-
-        # Check if this line is a profile header
-        is_header = False
-        for p in profiles:
-            if i == p["line_start"]:
-                in_profile = p["name"]
-                is_header = True
-                break
-
-        if is_header:
-            new_lines.append(line)
-            continue
-
-        # For FALCON_ variable lines (except SECRET), comment/uncomment based on target
-        if "FALCON_CLIENT_ID=" in stripped or "FALCON_BASE_URL=" in stripped:
-            # Get the raw key=value (strip any leading #)
-            raw = stripped.lstrip("#")
-            if in_profile == target_name:
-                # Uncomment: write raw
-                new_lines.append(raw + "\n")
-            else:
-                # Comment out: ensure it starts with #
-                new_lines.append("#" + raw + "\n")
-        elif "FALCON_CLIENT_SECRET=" in stripped:
-            # Leave SECRET lines as-is — secrets live in OS keychain
-            new_lines.append(line)
-        else:
-            new_lines.append(line)
-
-    # Write atomically
-    tmp_path = ENV_FILE + ".tmp"
-    with open(tmp_path, "w") as f:
-        f.writelines(new_lines)
-    os.replace(tmp_path, ENV_FILE)
-    os.chmod(ENV_FILE, 0o600)
-
-    # Reload env vars
-    from dotenv import load_dotenv
-    load_dotenv(ENV_FILE, override=True)
-
-    # Inject secret from keychain if available
-    if keyring_available():
-        inject_secret_to_env(target_name)
-
-    logger.info(f"Switched active CID profile to: {target_name}")
-    return True
 
 
 # Module-level convenience: import and use the singleton directly

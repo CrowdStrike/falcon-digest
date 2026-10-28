@@ -37,10 +37,10 @@ import logging
 import re
 import threading
 from datetime import datetime, timedelta, timezone
-from dotenv import load_dotenv
+from falcon_secrets import load_config_into_env
 
-# Load environment variables
-load_dotenv()
+# Load credentials from the encrypted config store (migrating a legacy .env once)
+load_config_into_env()
 
 # ============ STRUCTURED LOGGING ============
 
@@ -56,37 +56,41 @@ class ConfigError(Exception):
 
 
 def validate_config():
-    """Validate all required environment variables are set.
+    """Validate that Falcon API credentials are set.
 
-    Checks both Falcon API credentials and LLM configuration.
-    Raises ConfigError with a clear message listing all missing values.
+    Raises:
+        ConfigError: Listing every missing value.
     """
     errors = []
-
-    # Falcon API credentials
     if not os.getenv("FALCON_CLIENT_ID", "").strip():
         errors.append("FALCON_CLIENT_ID is not set")
     if not os.getenv("FALCON_CLIENT_SECRET", "").strip():
         errors.append("FALCON_CLIENT_SECRET is not set")
-
-    # LLM configuration
-    llm_endpoint = os.getenv("LLM_ENDPOINT", "").strip()
-    llm_key = os.getenv("LLM_API_KEY", "").strip()
-    if not llm_endpoint:
-        errors.append("LLM_ENDPOINT is not set")
-    if not llm_key:
-        errors.append("LLM_API_KEY is not set")
-
-    # LLM provider validation
-    provider = os.getenv("LLM_PROVIDER", "anthropic").lower()
-    if provider not in ("anthropic", "openai"):
-        errors.append(f"LLM_PROVIDER '{provider}' is not supported (use 'anthropic' or 'openai')")
-
     if errors:
         raise ConfigError(
-            "Required configuration missing in .env file:\n"
+            "Falcon API configuration is incomplete:\n"
             + "\n".join(f"  - {e}" for e in errors)
-            + "\n\nSee .env.example for details."
+            + "\n\nAdd a CID profile in the dashboard Settings page."
+        )
+
+
+def validate_llm_config():
+    """Validate LLM settings. Only needed for AI chat; the API key is optional.
+
+    Raises:
+        ConfigError: If no endpoint is set or the provider is unsupported.
+    """
+    errors = []
+    if not os.getenv("LLM_ENDPOINT", "").strip():
+        errors.append("LLM_ENDPOINT is not set")
+    provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower() or "anthropic"
+    if provider not in ("anthropic", "openai"):
+        errors.append(f"LLM_PROVIDER '{provider}' is not supported (use 'anthropic' or 'openai')")
+    if errors:
+        raise ConfigError(
+            "LLM configuration is incomplete:\n"
+            + "\n".join(f"  - {e}" for e in errors)
+            + "\n\nConfigure the LLM in the dashboard Settings page."
         )
 
 
@@ -119,7 +123,7 @@ _cached_credentials = {"client_id": None, "client_secret": None, "base_url": Non
 
 
 def _credentials_changed() -> bool:
-    """Check if .env credentials differ from what's cached."""
+    """Check if the credentials in os.environ differ from what's cached."""
     current = {
         "client_id": os.getenv("FALCON_CLIENT_ID"),
         "client_secret": os.getenv("FALCON_CLIENT_SECRET"),
@@ -146,12 +150,11 @@ def clear_client_cache():
 def get_falcon_client(service_class):
     """Get or create a cached Falcon API client. Auto-clears on credential change."""
     with _client_lock:
-        # Detect credential change — reload .env and clear stale clients
+        # Detect credential change (profile switch) and drop stale clients
         if _credentials_changed():
-            load_dotenv(override=True)
             _client_cache.clear()
             _update_cached_credentials()
-            logger.info("Credentials changed — cleared client cache and reloaded .env")
+            logger.info("Credentials changed — cleared client cache")
 
         class_name = service_class.__name__
         if class_name not in _client_cache:
@@ -2715,13 +2718,9 @@ if __name__ == "__main__":
     import sys
     from falcon_secrets import config_store
 
-    _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if not config_store.has_config() and os.path.isfile(_env_path):
-        config_store.migrate_from_env(_env_path)
-        config_store._load()
-
-    config_store.inject_to_env()
-
+    if config_store.load_error:
+        print(f"\nError: {config_store.load_error}\n", file=sys.stderr)
+        sys.exit(1)
     try:
         validate_config()
     except ConfigError as e:

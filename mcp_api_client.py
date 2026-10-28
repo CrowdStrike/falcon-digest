@@ -28,21 +28,30 @@ from crwd_mcp_server import (
     search_alerts, get_host_details, test_fql_filter, list_available_products,
     search_cases, search_detections, search_vulnerabilities,
     search_threatgraph, get_security_posture, search_hosts,
-    validate_config, ConfigError
+    validate_config, validate_llm_config, ConfigError
 )
 from falcon_cache import cache as falcon_cache
-from falcon_secrets import config_store
-
-config_store.inject_to_env()
 
 # Logging
 logger = logging.getLogger("falcon_mcp.client")
 
-# LLM configuration
-LLM_ENDPOINT = os.getenv("LLM_ENDPOINT", "")
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic").lower()
-LLM_MODEL = os.getenv("LLM_MODEL", "")
+
+def _llm_settings() -> dict:
+    """Read the LLM configuration from the environment at call time.
+
+    Settings saved in the dashboard are injected into ``os.environ``, so
+    reading them per call picks up changes without a restart.
+
+    Returns:
+        Dict with ``endpoint``, ``api_key``, ``provider`` and ``model`` keys.
+    """
+    return {
+        "endpoint": os.getenv("LLM_ENDPOINT", "").strip().rstrip("/"),
+        "api_key": os.getenv("LLM_API_KEY", "").strip(),
+        "provider": os.getenv("LLM_PROVIDER", "anthropic").strip().lower() or "anthropic",
+        "model": os.getenv("LLM_MODEL", "").strip(),
+    }
+
 
 # Retry configuration
 MAX_RETRIES = 3
@@ -189,11 +198,16 @@ TOOL_DEFINITIONS = [
 ]
 
 
-def _default_model():
-    """Return the configured model name, falling back to provider defaults."""
-    if LLM_MODEL:
-        return LLM_MODEL
-    return "claude-4-6-opus" if LLM_PROVIDER == "anthropic" else "gpt-4o"
+def _default_model() -> str:
+    """Return the configured model name, falling back to provider defaults.
+
+    Returns:
+        The model name to send to the LLM endpoint.
+    """
+    settings = _llm_settings()
+    if settings["model"]:
+        return settings["model"]
+    return "claude-4-6-opus" if settings["provider"] == "anthropic" else "gpt-4o"
 
 
 def _to_openai_request(messages, tools, model, max_tokens):
@@ -315,28 +329,32 @@ def _from_openai_response(data):
     }
 
 
-def call_llm(messages, tools=None, system_context=None):
-    """
-    Call configured LLM endpoint.
+def call_llm(messages, tools=None, system_context=None) -> dict:
+    """Call the configured LLM endpoint.
+
+    The LLM configuration is read from the environment on every call, so
+    changes saved in the dashboard Settings page apply immediately.
 
     Args:
-        messages: List of message dicts
-        tools: Optional tool definitions
-        system_context: Optional cached data context to prepend.
-                        If None and the cache is running, auto-injects cached summary.
+        messages: List of message dicts.
+        tools: Optional tool definitions.
+        system_context: Optional cached data context to prepend. If None and
+            the cache is running, the cached summary is injected automatically.
+
+    Returns:
+        The LLM response in native (Anthropic Messages) format.
 
     Raises:
-        ConfigError: If required configuration is missing.
+        ConfigError: If the LLM endpoint or provider is not configured.
     """
-    if LLM_PROVIDER not in ("anthropic", "openai"):
-        raise ConfigError(f"LLM_PROVIDER '{LLM_PROVIDER}' is not supported (use 'anthropic' or 'openai')")
+    validate_llm_config()
+    settings = _llm_settings()
+    provider = settings["provider"]
+    endpoint = settings["endpoint"]
 
-    validate_config()
-
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Content-Type": "application/json"}
+    if settings["api_key"]:
+        headers["Authorization"] = f"Bearer {settings['api_key']}"
 
     # Auto-inject cache context if available and not explicitly provided
     if system_context is None and falcon_cache.is_running:
@@ -357,7 +375,7 @@ def call_llm(messages, tools=None, system_context=None):
 
     # Prepend cached context as a message pair so the AI has data upfront.
     # We avoid using the "system" payload field since some endpoints may not support it.
-    _is_local = "localhost" in LLM_ENDPOINT or "127.0.0.1" in LLM_ENDPOINT
+    _is_local = "localhost" in endpoint or "127.0.0.1" in endpoint
 
     if system_context:
         if _is_local:
@@ -465,7 +483,7 @@ You MUST NOT:
 
     model = _default_model()
 
-    if LLM_PROVIDER == "openai":
+    if provider == "openai":
         url_path, payload = _to_openai_request(messages, tools, model, max_tokens=4096)
     else:
         # Native format (default)
@@ -478,13 +496,13 @@ You MUST NOT:
             payload["tools"] = tools
         url_path = "/v1/messages"
 
-    logger.info("Calling LLM (provider=%s, model=%s, messages=%d)", LLM_PROVIDER, model, len(messages))
+    logger.info("Calling LLM (provider=%s, model=%s, messages=%d)", provider, model, len(messages))
 
     last_error = None
     for attempt in range(MAX_RETRIES):
         try:
             response = _session.post(
-                f"{LLM_ENDPOINT}{url_path}",
+                f"{endpoint}{url_path}",
                 headers=headers,
                 json=payload,
                 timeout=300
@@ -496,7 +514,7 @@ You MUST NOT:
             response.raise_for_status()
             logger.info("LLM responded (status=%d)", response.status_code)
             data = response.json()
-            if LLM_PROVIDER == "openai":
+            if provider == "openai":
                 return _from_openai_response(data)
             return data
         except requests.exceptions.ConnectionError as e:
@@ -513,93 +531,80 @@ You MUST NOT:
 
 # ============ RESPONSE GROUNDING VALIDATION ============
 
-def _extract_known_identifiers() -> dict:
-    """Extract all known identifiers from the cache for validation."""
-    known = {"hostnames": set(), "cves": set(), "ips": set(), "case_ids": set()}
-    if not falcon_cache.is_running:
-        return known
+_CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.IGNORECASE)
+_IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
-    posture = falcon_cache.get_parsed("security_posture")
-    if posture and isinstance(posture, dict):
-        for host in posture.get("hosts", {}).get("details", []):
-            if host.get("hostname"):
-                known["hostnames"].add(host["hostname"].lower())
-            for ip_field in ("local_ip", "external_ip"):
-                if host.get(ip_field):
-                    known["ips"].add(host[ip_field])
 
-    for key in ("vulnerabilities_critical",):
-        data = falcon_cache.get_parsed(key)
-        if data and isinstance(data, dict):
-            for v in data.get("vulnerabilities", []):
-                if v.get("cve_id"):
-                    known["cves"].add(v["cve_id"].upper())
-                if v.get("hostname"):
-                    known["hostnames"].add(v["hostname"].lower())
+def _scan_identifiers(text: str, known: dict) -> None:
+    """Add every CVE and IPv4 address found in ``text`` to ``known`` in place.
 
-    for key in ("alerts_critical", "alerts_high", "alerts_all"):
-        data = falcon_cache.get_parsed(key)
-        if data and isinstance(data, dict):
-            for a in data.get("alerts", []):
-                if a.get("hostname"):
-                    known["hostnames"].add(a["hostname"].lower())
+    Args:
+        text: Any string (cached JSON, tool result, etc.).
+        known: Dict with ``cves`` and ``ips`` sets to update.
+    """
+    if not text:
+        return
+    known["cves"].update(m.upper() for m in _CVE_RE.findall(text))
+    known["ips"].update(_IP_RE.findall(text))
 
-    for key in ("detections_recent",):
-        data = falcon_cache.get_parsed(key)
-        if data and isinstance(data, dict):
-            for d in data.get("detections", []):
-                if d.get("hostname"):
-                    known["hostnames"].add(d["hostname"].lower())
 
-    data = falcon_cache.get_parsed("cases_recent")
-    if data and isinstance(data, dict):
-        for c in data.get("cases", []):
-            if c.get("id"):
-                known["case_ids"].add(str(c["id"]))
+def _extract_known_identifiers(extra_context: list[str] | None = None) -> dict:
+    """Collect identifiers that are backed by Falcon data.
 
-    data = falcon_cache.get_parsed("exposure_management")
-    if data and isinstance(data, dict):
-        for a in data.get("assets", []):
-            if a.get("name"):
-                known["hostnames"].add(a["name"].lower())
+    Scans every cached entry plus any tool results from the current chat
+    turn, so identifiers returned by a live tool call are treated as known.
 
-    data = falcon_cache.get_parsed("identity_protection")
-    if data and isinstance(data, dict):
-        for r in data.get("risky_entities", []):
-            if r.get("display_name"):
-                known["hostnames"].add(r["display_name"].lower())
+    Args:
+        extra_context: Optional tool result strings from the current turn.
 
+    Returns:
+        Dict with ``cves`` and ``ips`` sets.
+    """
+    known = {"cves": set(), "ips": set()}
+    if falcon_cache.is_running:
+        for entry in falcon_cache.get_all().values():
+            data = entry.get("data") if isinstance(entry, dict) else None
+            _scan_identifiers(data if isinstance(data, str) else json.dumps(data, default=str), known)
+    for chunk in extra_context or []:
+        _scan_identifiers(chunk if isinstance(chunk, str) else json.dumps(chunk, default=str), known)
     return known
 
 
-def validate_response(text: str) -> str:
-    """Validate LLM response against cached data. Flag or remove hallucinated identifiers."""
-    if not falcon_cache.is_running:
+def validate_response(text: str, extra_context: list[str] | None = None) -> str:
+    """Check CVEs and IPs in an LLM answer against Falcon data.
+
+    The answer text is never rewritten. Identifiers that cannot be found in
+    the cache or in this turn's tool results are listed once, deduplicated,
+    in a note appended to the answer. A category is only checked when there
+    is reference data for it, so an empty cache does not flag everything.
+
+    Args:
+        text: The LLM answer.
+        extra_context: Optional tool result strings from the current turn.
+
+    Returns:
+        The original text, with a verification note appended if needed.
+    """
+    if not text or (not falcon_cache.is_running and not extra_context):
         return text
 
-    known = _extract_known_identifiers()
-    warnings = []
+    known = _extract_known_identifiers(extra_context)
+    unverified = []
 
-    cve_pattern = re.compile(r'CVE-\d{4}-\d{4,}', re.IGNORECASE)
-    found_cves = cve_pattern.findall(text)
-    if found_cves and known["cves"]:
-        for cve in found_cves:
-            if cve.upper() not in known["cves"]:
-                warnings.append(f"{cve} not found in Falcon data")
-                text = text.replace(cve, f"~~{cve}~~")
+    found_cves = {m.upper() for m in _CVE_RE.findall(text)}
+    if known["cves"]:
+        unverified.extend(sorted(found_cves - known["cves"]))
 
-    ip_pattern = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
-    found_ips = ip_pattern.findall(text)
-    if found_ips and known["ips"]:
-        for ip in found_ips:
-            if ip not in known["ips"] and not ip.startswith("0.") and ip != "0.0.0.0":
-                warnings.append(f"IP {ip} not found in Falcon data")
-                text = text.replace(ip, f"~~{ip}~~")
+    found_ips = {ip for ip in _IP_RE.findall(text) if not ip.startswith("0.")}
+    if known["ips"]:
+        unverified.extend(sorted(found_ips - known["ips"]))
 
-    if warnings:
-        disclaimer = "\n\n---\n⚠️ **Grounding check**: " + "; ".join(warnings) + ". Struck-through items could not be verified against cached Falcon data."
-        text += disclaimer
-        logger.warning("Grounding validation flagged: %s", "; ".join(warnings))
+    if unverified:
+        text += (
+            "\n\n---\n⚠️ **Note:** could not verify these identifiers against cached "
+            "Falcon data: " + ", ".join(f"`{u}`" for u in unverified) + "."
+        )
+        logger.warning("Grounding check: unverified identifiers: %s", ", ".join(unverified))
 
     return text
 
@@ -687,10 +692,18 @@ TOOL_LABELS = {
 }
 
 
-def chat(user_message: str):
-    """Chat with LLM using MCP tools"""
+def chat(user_message: str) -> str:
+    """Chat with the LLM using MCP tools and print the answer.
+
+    Args:
+        user_message: The user's question.
+
+    Returns:
+        The final answer text, including any grounding note.
+    """
 
     messages = [{"role": "user", "content": user_message}]
+    turn_tool_results = []
 
     print()
     response = call_llm(messages, TOOL_DEFINITIONS)
@@ -705,6 +718,7 @@ def chat(user_message: str):
         tool_results = []
         for tool_call in tool_calls:
             result = execute_tool(tool_call["name"], tool_call["input"])
+            turn_tool_results.append(result)
 
             tool_results.append({
                 "type": "tool_result",
@@ -723,7 +737,7 @@ def chat(user_message: str):
         if block.get("type") == "text":
             final_text += block.get("text", "")
 
-    final_text = validate_response(final_text)
+    final_text = validate_response(final_text, turn_tool_results)
     print(f"\n{final_text}\n")
     return final_text
 
@@ -782,6 +796,7 @@ if __name__ == "__main__":
 
     try:
         validate_config()
+        validate_llm_config()
     except ConfigError as e:
         print(f"\nError: {e}\n", file=sys.stderr)
         sys.exit(1)

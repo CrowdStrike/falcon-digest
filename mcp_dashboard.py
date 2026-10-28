@@ -23,7 +23,6 @@ import html
 import json
 import logging
 import os
-import re
 import time
 import pandas as pd
 import plotly.express as px
@@ -34,12 +33,12 @@ from crwd_mcp_server import (
     search_cases, search_detections, search_vulnerabilities,
     search_threatgraph, get_security_posture, get_ngsiem_ingestion,
     get_identity_protection, get_cloud_security, get_exposure_management,
-    validate_config, ConfigError
+    validate_config, validate_llm_config, ConfigError, clear_client_cache
 )
 from mcp_api_client import call_llm, execute_tool, validate_response, TOOL_DEFINITIONS
-from falcon_cache import cache as falcon_cache
-from falcon_auth import UserManager
-from falcon_secrets import config_store, ConfigStore, CLOUD_REGIONS
+from falcon_cache import cache as falcon_cache, sanitize_error as _sanitize_error
+from falcon_auth import UserManager, lockout_remaining
+from falcon_secrets import config_store, CLOUD_REGIONS
 
 _logger = logging.getLogger("falcon_mcp.dashboard")
 
@@ -56,32 +55,67 @@ st.set_page_config(
 
 _user_mgr = UserManager()
 
+# Fail closed: never treat an unreadable users or config file as "first run"
+if _user_mgr.load_error:
+    st.error(
+        "The users file `.falcon_users.json` exists but could not be read, so the dashboard "
+        "will not start. Restore it from backup or fix its permissions, then reload. "
+        "Delete it only if you intend to reset every account."
+    )
+    st.stop()
+if config_store.load_error:
+    st.error(
+        f"{config_store.load_error} The dashboard will not overwrite it. Make sure this process "
+        "can reach the same OS keychain or `.falcon_config.key` the config was created with, then reload."
+    )
+    st.stop()
+
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
     st.session_state.current_user = None
 
+
+@st.cache_resource(show_spinner=False)
+def _announce_setup_token(token: str) -> None:
+    """Print the first-run setup token to the server console (once per token per process)."""
+    print(
+        "\n" + "=" * 64
+        + "\n  Falcon Digest first-run setup token:\n\n    " + token
+        + "\n\n  Enter it in the browser to create the admin account."
+        + "\n" + "=" * 64 + "\n",
+        flush=True,
+    )
+
+
 if not _user_mgr.has_users():
+    _announce_setup_token(_user_mgr.get_or_create_setup_token())
     st.markdown(
         '<div style="max-width:440px; margin:60px auto; text-align:center;">'
         '<h2 style="color:#EC0000;">Falcon Digest — Initial Setup</h2>'
-        '<p style="color:#6B7280;">Create an admin account to get started.</p></div>',
+        '<p style="color:#6B7280;">Create an admin account to get started. The setup token '
+        'is printed in the terminal running <code>streamlit run</code> and stored in '
+        '<code>.falcon_users.json.setup</code>.</p></div>',
         unsafe_allow_html=True
     )
     with st.form("setup_form"):
+        setup_token = st.text_input("Setup token", type="password")
         setup_user = st.text_input("Username", placeholder="admin")
         setup_pw = st.text_input("Password", type="password", placeholder="Min 8 characters")
         setup_pw2 = st.text_input("Confirm Password", type="password")
         setup_submit = st.form_submit_button("Create Admin Account", type="primary")
         if setup_submit:
-            if setup_pw != setup_pw2:
+            if not _user_mgr.verify_setup_token(setup_token):
+                st.error("Invalid setup token.")
+            elif setup_pw != setup_pw2:
                 st.error("Passwords do not match.")
             else:
                 err = _user_mgr.add_user(setup_user, setup_pw, role="admin")
                 if err:
                     st.error(err)
                 else:
+                    _user_mgr.consume_setup_token()
                     st.session_state.authenticated = True
-                    st.session_state.current_user = {"username": setup_user.strip().lower(), "role": "admin"}
+                    st.session_state.current_user = _user_mgr.get_user(setup_user)
                     st.rerun()
     st.stop()
 
@@ -102,31 +136,66 @@ if not st.session_state.authenticated:
                 st.session_state.authenticated = True
                 st.session_state.current_user = result
                 st.rerun()
+            _wait = lockout_remaining(login_user)
+            if _wait:
+                st.error(f"Too many failed attempts. Try again in {int(_wait) + 1}s.")
             else:
                 st.error("Invalid username or password.")
     st.stop()
 
+# Re-read the user on every run so removals and role changes apply to live sessions
+_fresh_user = _user_mgr.get_user((st.session_state.current_user or {}).get("username", ""))
+if not _fresh_user:
+    st.session_state.authenticated = False
+    st.session_state.current_user = None
+    st.rerun()
+st.session_state.current_user = _fresh_user
+
+
+def _is_admin() -> bool:
+    return (st.session_state.get("current_user") or {}).get("role") == "admin"
+
+
 # ============ CONFIGURATION & SETTINGS ============
 
-_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-if not config_store.has_config() and os.path.isfile(_env_path):
-    config_store.migrate_from_env(_env_path)
-    config_store._load()
+_SESSION_DATA_KEYS = [
+    "posture_data", "detections_data", "cases_data", "vulns_data",
+    "tg_edge_types", "ingestion_data", "identity_data",
+    "cloud_security_data", "exposure_data", "_cache_sync_count",
+]
+
+
+def _apply_config_change() -> bool:
+    """Push the stored config into the process env and drop data from a previous CID.
+
+    Returns:
+        True if the active CID changed (cache cleared and refresh started).
+    """
+    config_store.inject_to_env()
+    clear_client_cache()
+    if falcon_cache.check_cid_change():
+        for key in _SESSION_DATA_KEYS:
+            st.session_state.pop(key, None)
+        falcon_cache.force_refresh()
+        return True
+    return False
 
 
 def _render_settings_page():
-    """Render the Settings page for Falcon API and LLM configuration."""
+    """Render the Settings page for Falcon API and LLM configuration (admins only)."""
     st.markdown(
         '<h2 style="color:#EC0000;">Settings</h2>'
         '<p style="color:#6B7280;">Configure Falcon API credentials and LLM settings.</p>',
         unsafe_allow_html=True
     )
+    if not _is_admin():
+        st.info("Only an admin can change settings. Ask an admin to update the configuration.")
+        return
 
     # --- CID Profiles ---
     st.subheader("CrowdStrike Falcon API Profiles")
     profiles = config_store.list_profiles()
     if profiles:
-        active_name = config_store.get_active_profile_name()
         for p in profiles:
             marker = " (active)" if p["active"] else ""
             cols = st.columns([3, 1, 1])
@@ -134,62 +203,76 @@ def _render_settings_page():
             if not p["active"]:
                 if cols[1].button("Activate", key=f"activate_{p['name']}"):
                     config_store.set_active_profile(p["name"])
-                    config_store.inject_to_env()
+                    _apply_config_change()
                     st.rerun()
             if cols[2].button("Delete", key=f"delete_{p['name']}"):
                 config_store.delete_profile(p["name"])
+                _apply_config_change()
                 st.rerun()
         st.divider()
 
     st.markdown("**Add / Edit Profile**")
+    st.caption("To update an existing profile, enter its name. Leave the secret blank to keep the stored one.")
     with st.form("profile_form", clear_on_submit=True):
         pcol1, pcol2 = st.columns(2)
         profile_name = pcol1.text_input("Profile Name", value="default" if not profiles else "", placeholder="e.g. prod-us1")
         cloud_region = pcol2.selectbox("Cloud Region", list(CLOUD_REGIONS.keys()), index=0)
         client_id = st.text_input("Client ID", placeholder="Falcon API Client ID")
         client_secret = st.text_input("Client Secret", type="password", placeholder="Falcon API Client Secret")
-        save_profile = st.form_submit_button("Save Profile", type="primary")
-        if save_profile:
-            if not profile_name.strip() or not client_id.strip() or not client_secret.strip():
-                st.error("Profile name, Client ID, and Client Secret are required.")
+        if st.form_submit_button("Save Profile", type="primary"):
+            try:
+                config_store.save_profile(profile_name, client_id, client_secret, CLOUD_REGIONS[cloud_region])
+            except ValueError as e:
+                st.error(str(e))
             else:
-                config_store.save_profile(profile_name.strip(), client_id, client_secret, CLOUD_REGIONS[cloud_region])
-                config_store.inject_to_env()
+                _apply_config_change()
                 st.success(f"Profile '{html.escape(profile_name.strip())}' saved.")
                 st.rerun()
 
     # --- LLM Settings ---
-    st.subheader("LLM / AI Chat")
-    llm = config_store.get_llm_config()
+    st.subheader("LLM / AI Chat (optional)")
+    llm = config_store.get_llm_config()  # never includes the stored API key
     with st.form("llm_form"):
-        llm_endpoint = st.text_input("LLM Endpoint", value=llm.get("LLM_ENDPOINT", ""), placeholder="https://api.anthropic.com")
-        llm_key = st.text_input("LLM API Key", type="password", value=llm.get("LLM_API_KEY", ""), placeholder="Optional for local models")
+        llm_endpoint = st.text_input("LLM Endpoint", value=llm.get("LLM_ENDPOINT", ""), placeholder="https://api.anthropic.com or http://localhost:11434")
+        llm_key = st.text_input(
+            "LLM API Key", type="password",
+            placeholder="Stored — leave blank to keep" if llm.get("LLM_API_KEY_SET") else "Not needed for local models",
+        )
+        clear_key = st.checkbox("Clear stored API key", value=False, disabled=not llm.get("LLM_API_KEY_SET"))
         lcol1, lcol2 = st.columns(2)
         llm_provider = lcol1.selectbox("Provider", ["anthropic", "openai"], index=0 if llm.get("LLM_PROVIDER", "anthropic") == "anthropic" else 1)
         llm_model = lcol2.text_input("Model Override", value=llm.get("LLM_MODEL", ""), placeholder="Leave blank for default")
-        save_llm = st.form_submit_button("Save LLM Settings", type="primary")
-        if save_llm:
-            config_store.save_llm_config(llm_endpoint, llm_key, llm_provider, llm_model)
+        if st.form_submit_button("Save LLM Settings", type="primary"):
+            api_key = "" if clear_key else (llm_key or None)
+            config_store.save_llm_config(llm_endpoint, api_key, llm_provider, llm_model)
             config_store.inject_to_env()
             st.success("LLM settings saved.")
             st.rerun()
 
 
-# First-run: if no config exists, show settings page and stop
-if not config_store.has_config():
-    _render_settings_page()
+def _render_setup_required(message: str):
+    """Show Settings to admins, or a contact-an-admin notice to viewers, then stop."""
+    if _is_admin():
+        st.info(message)
+        _render_settings_page()
+    else:
+        st.warning(f"{message} Ask an admin to finish the configuration.")
+    if st.button("Logout", key="setup_logout_btn"):
+        st.session_state.authenticated = False
+        st.session_state.current_user = None
+        st.rerun()
     st.stop()
 
-# Inject config into environment for FalconPy / LLM client
+
+if not config_store.has_config():
+    _render_setup_required("Add a Falcon API profile to get started.")
+
 config_store.inject_to_env()
 
-# Validate Falcon API config
 try:
     validate_config()
-except ConfigError:
-    st.warning("Falcon API configuration is incomplete or invalid. Please update Settings.")
-    _render_settings_page()
-    st.stop()
+except ConfigError as e:
+    _render_setup_required(_sanitize_error(e, max_len=400))
 
 # ============ THEME CSS ============
 
@@ -599,16 +682,6 @@ def render_empty_state(module_name, hint=None):
     st.info(msg)
 
 
-_PATH_RE = re.compile(r'(/[\w./-]+){3,}')
-
-def _sanitize_error(msg: str, max_len: int = 200) -> str:
-    """Strip internal paths and truncate error messages for safe display."""
-    sanitized = _PATH_RE.sub("[path]", str(msg))
-    if len(sanitized) > max_len:
-        sanitized = sanitized[:max_len] + "…"
-    return sanitized
-
-
 def compute_sla_compliance(detections_list):
     """Compute SLA compliance % from a list of detection dicts.
 
@@ -786,9 +859,9 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-    # --- CID Profile Selector ---
+    # --- CID Profile Selector (admin only: switching changes the CID for every session) ---
     _cfg_profiles = config_store.list_profiles()
-    if len(_cfg_profiles) > 1:
+    if len(_cfg_profiles) > 1 and _is_admin():
         _profile_names = [p["name"] for p in _cfg_profiles]
         _active_idx = next((i for i, p in enumerate(_cfg_profiles) if p["active"]), 0)
         selected_profile = st.selectbox(
@@ -802,19 +875,7 @@ with st.sidebar:
         )
         if selected_profile != _cfg_profiles[_active_idx]["name"]:
             config_store.set_active_profile(selected_profile)
-            config_store.inject_to_env()
-            from crwd_mcp_server import clear_client_cache
-            try:
-                clear_client_cache()
-            except Exception:
-                pass
-            falcon_cache.check_cid_change()
-            for key in ["posture_data", "detections_data", "cases_data", "vulns_data",
-                         "tg_edge_types", "ingestion_data", "identity_data",
-                         "cloud_security_data", "exposure_data",
-                         "_cache_sync_count"]:
-                st.session_state.pop(key, None)
-            falcon_cache.force_refresh()
+            _apply_config_change()
             time.sleep(0.2)
             _cid_prog = st.empty()
             _cid_stat = st.empty()
@@ -831,11 +892,11 @@ with st.sidebar:
             st.rerun()
     else:
         _active = config_store.get_active_profile_name()
-        st.caption(f"Profile: {_active}" if _active else "Config loaded")
+        st.caption(f"Profile: {html.escape(_active)}" if _active else "Config loaded")
 
     # --- Settings link (admin only) ---
-    if st.session_state.current_user and st.session_state.current_user.get("role") == "admin":
-        if st.button("Settings", key="sidebar_settings_btn", use_container_width=True):
+    if _is_admin():
+        if st.button("Settings", key="sidebar_settings_btn", width="stretch"):
             st.session_state["_show_settings"] = True
             st.rerun()
 
@@ -985,7 +1046,7 @@ with st.sidebar:
                     _u_name = _u["username"]
                     _u_cols = st.columns([2, 1, 1])
                     with _u_cols[0]:
-                        st.markdown(f"**{html.escape(_u_name)}** ({_u['role']})")
+                        st.markdown(f"**{html.escape(_u_name)}** ({html.escape(_u['role'])})")
                     with _u_cols[1]:
                         if _u_name != _cur_user.get("username"):
                             if st.button("Remove", key=f"rm_{_u_name}"):
@@ -1079,7 +1140,7 @@ with _period_col:
 
 # ============ SETTINGS PAGE (on-demand) ============
 
-if st.session_state.get("_show_settings"):
+if st.session_state.get("_show_settings") and _is_admin():
     _render_settings_page()
     if st.button("Back to Dashboard"):
         del st.session_state["_show_settings"]
@@ -2290,9 +2351,9 @@ if tab_identity is not None:
                     factors = entity.get("risk_factors", [])
                     if factors:
                         _admin_tag = " &#128272;" if entity.get("is_admin") else ""
-                        _dept_tag = f" | {html.escape(entity.get('department'))}" if entity.get("department") else ""
+                        _dept_tag = f" | {html.escape(str(entity.get('department')))}" if entity.get("department") else ""
                         st.markdown(
-                            f"**{html.escape(entity.get('display_name', 'N/A'))}** "
+                            f"**{html.escape(str(entity.get('display_name') or 'N/A'))}** "
                             f"(score: {entity.get('risk_score', 'N/A')}{_dept_tag}){_admin_tag}",
                             unsafe_allow_html=True
                         )
@@ -3028,6 +3089,14 @@ with tab_chat:
         if "chat_messages" not in st.session_state:
             st.session_state.chat_messages = []
 
+        try:
+            validate_llm_config()
+        except ConfigError:
+            st.info("AI chat isn't configured yet. "
+                    + ("Open **Settings** in the sidebar to add an LLM endpoint." if _is_admin()
+                       else "Ask an admin to add an LLM endpoint in Settings."))
+            return
+
         st.markdown("**Quick Actions**")
         prompt_cols = st.columns(5)
         guided_prompts = [
@@ -3087,6 +3156,7 @@ with tab_chat:
                         unsafe_allow_html=True
                     )
                 response = call_llm(api_messages, TOOL_DEFINITIONS)
+                turn_tool_results = []
 
                 max_iterations = 10
                 iteration = 0
@@ -3100,6 +3170,7 @@ with tab_chat:
                             "input": tc["input"], "result": None
                         })
                         result = execute_tool(tc["name"], tc["input"])
+                        turn_tool_results.append(result)
                         st.session_state.chat_messages[-1]["result"] = result
                         tool_results.append({
                             "type": "tool_result", "tool_use_id": tc["id"], "content": result
@@ -3115,7 +3186,7 @@ with tab_chat:
                     if block.get("type") == "text":
                         final_text += block.get("text", "")
                 if final_text:
-                    final_text = validate_response(final_text)
+                    final_text = validate_response(final_text, turn_tool_results)
                     stream_to_chat(chat_container, final_text)
                     st.session_state.chat_messages.append({"role": "assistant", "content": final_text})
 

@@ -10,7 +10,7 @@ Extract, visualize, and query your CrowdStrike Falcon security data locally. Bui
 - **13 MCP Tools** — Search alerts, detections, cases, vulnerabilities, hosts, ThreatGraph IOCs, security posture, NGSIEM ingestion, identity protection, cloud security, exposure management, FQL validation, and more
 - **4 MCP Resources** — FQL cheatsheet, severity definitions, MITRE ATT&CK mapping, case status guide
 - **5 MCP Prompts** — Case triage, threat hunting, vulnerability assessment, executive briefing, identity risk review
-- **Background Cache** — Pre-fetches all Falcon data sources for instant dashboard loads with file persistence
+- **Background Cache** — Pre-fetches all Falcon data sources for instant dashboard loads, persisted to an encrypted cache file
 
 ### Dashboard
 - **11-Tab Dashboard** — Executive summary, detections, cases, vulnerabilities, identity, cloud security, exposure, IOC search, data ingestion, FQL tools, AI chat
@@ -62,9 +62,11 @@ source venv/bin/activate
 streamlit run mcp_dashboard.py
 
 # On first launch:
-# 1. Create an admin account (setup wizard)
-# 2. Enter Falcon API credentials in the Settings page
-# 3. Optionally configure LLM settings for AI chat
+# 1. Copy the one-time setup token printed in this terminal
+#    (also stored in .falcon_users.json.setup)
+# 2. Create the admin account in the browser using that token
+# 3. Enter Falcon API credentials in the Settings page
+# 4. Optionally configure LLM settings for AI chat
 
 # MCP server (stdio — for IDE/editor integration)
 python crwd_mcp_server.py
@@ -75,9 +77,11 @@ python mcp_api_client.py
 # CLI client (single query)
 python mcp_api_client.py "show security posture"
 
-# Cache daemon (keeps data warm for instant dashboard loads)
+# Cache daemon (keeps data warm for instant dashboard loads; reads the same encrypted config)
 python falcon_cache_daemon.py [poll_interval_seconds]
 ```
+
+The dashboard only listens on `127.0.0.1` by default (see `.streamlit/config.toml`). To reach it from other machines, change `server.address` deliberately and put it behind TLS / a reverse proxy.
 
 ## Local LLM with Ollama
 
@@ -123,6 +127,8 @@ Run the AI chat features entirely offline using [Ollama](https://ollama.com) —
    - **Model Override**: `llama3.2:3b` (or whichever model you pulled)
    - **LLM API Key**: leave blank (not needed for Ollama)
 
+   The LLM is optional — the dashboard works with Falcon credentials alone. Until an endpoint is set, the AI Chat tab asks you to configure it in Settings.
+
 5. **Run the dashboard or CLI as usual**
 
    ```bash
@@ -146,16 +152,19 @@ Run the AI chat features entirely offline using [Ollama](https://ollama.com) —
 ## Security
 
 - **Read-Only Access** — All Falcon API operations are strictly read-only. No RTR, no response actions, no write operations.
-- **Mandatory Authentication** — On first launch, create an admin account. All dashboard access requires login. Passwords are hashed with PBKDF2-SHA256 (600k iterations) and stored in `.falcon_users.json`. Admins can add/remove users and change roles from the sidebar.
-- **Encrypted Configuration** — All credentials (Falcon API, LLM keys) are stored in `.falcon_config.enc`, encrypted with Fernet (AES-128-CBC + HMAC-SHA256). No plaintext secrets on disk.
-- **OS Keychain Integration** — The encryption key is stored in the OS keychain (macOS Keychain, Linux Secret Service) via the `keyring` library. Falls back to a local key file (`.falcon_config.key`, chmod 0600) if keychain is unavailable.
-- **Encrypted Cache** — `.falcon_cache.json` is encrypted at rest using the same Fernet key.
-- **No .env Required** — All configuration is entered via the dashboard Settings UI. Legacy `.env` files are automatically migrated to encrypted storage on first run.
+- **Mandatory Authentication** — All dashboard access requires login. Passwords are hashed with PBKDF2-SHA256 (600k iterations, per-user salt) and stored in `.falcon_users.json`. Usernames are case-insensitive, and repeated failed logins trigger a temporary lockout with backoff.
+- **Protected First-Run Setup** — Creating the first admin requires a one-time setup token, printed to the terminal running `streamlit run` and stored in `.falcon_users.json.setup` (0600). The token is deleted after use. If `.falcon_users.json` exists but is corrupt or unreadable, the dashboard refuses to start instead of reopening setup.
+- **Roles** — Only admins can open Settings, manage users, and switch CID profiles; viewers can only view. Roles are re-checked on every page load, so removing or demoting a user takes effect immediately.
+- **Secrets Stay Server-Side** — Stored secrets (Falcon client secret, LLM API key) are never sent back to the browser. Leave a secret field blank in Settings to keep the existing value.
+- **Encrypted Configuration** — Credentials are stored in `.falcon_config.enc`, encrypted with Fernet (AES-128-CBC + HMAC-SHA256). The encryption key is kept in the OS keychain (service `falcon-digest`, via the `keyring` library) when available. Otherwise it is written to `.falcon_config.key` (0600) **next to the ciphertext** — in that mode the encryption only guards against casual disclosure (e.g. backups or syncs of just the config file), not against someone who can read the app directory as the same OS user.
+- **Fail Closed on Decrypt Errors** — If the config file exists but can't be decrypted (for example, a process that can't reach the keychain, or a lost key), the app shows an error and refuses to overwrite it rather than silently resetting your settings.
+- **Encrypted Cache** — `.falcon_cache.json` is encrypted with the same key. If encryption fails, the cache is not written to disk.
+- **Localhost by Default** — `.streamlit/config.toml` binds the dashboard to `127.0.0.1`.
 - **FQL Injection Prevention** — All user-supplied values are sanitized through a character whitelist (`sanitize_fql_value()`) before interpolation into FQL filter strings.
 - **XSS Protection** — API-sourced values rendered via `unsafe_allow_html=True` are escaped with `html.escape()`.
 - **Error Sanitization** — API error messages are stripped of internal file paths and truncated before display to prevent information leakage.
-- **File Permissions** — All sensitive files (`.falcon_config.enc`, `.falcon_config.key`, `.falcon_cache.json`, `.falcon_users.json`) are automatically set to `0600` (owner read/write only).
-- **No Credentials in Code** — All secrets live in encrypted storage or OS keychain (all gitignored). No credentials are logged or included in LLM context.
+- **File Permissions** — Sensitive files (`.falcon_config.enc`, `.falcon_config.key`, `.falcon_cache.json`, `.falcon_users.json`) are created with `0600` (owner read/write only) and written atomically.
+- **No Credentials in Code** — Secrets live in the encrypted config or the process environment, never in source. All data files are gitignored. No credentials are logged or included in LLM context.
 
 ## Architecture
 
@@ -164,11 +173,12 @@ crwd_mcp_server.py        MCP server: 13 tools, 4 resources, 5 prompts
 mcp_api_client.py          LLM API client with tool execution + CLI chat
 mcp_dashboard.py           Streamlit dashboard (11-tab UI with AI Chat)
 falcon_cache.py            Background polling cache with encrypted file persistence
-falcon_auth.py             User authentication (PBKDF2 hashed passwords)
-falcon_secrets.py          Encrypted config store (ConfigStore) and cache encryption
+falcon_auth.py             User authentication (PBKDF2 hashed passwords, setup token, lockout)
+falcon_secrets.py          Encrypted config store (ConfigStore), key management, cache encryption
 falcon_cache_daemon.py     Standalone cache daemon process
+.streamlit/config.toml     Streamlit settings (binds to 127.0.0.1)
 tests/                     pytest unit tests (mock-based)
-  conftest.py              Shared fixtures
+  conftest.py              Shared fixtures (isolated data dir, no real keychain)
   test_server_tools.py     Tool tests
   test_fql_security.py     FQL injection prevention tests
   test_cache.py            Cache tests
@@ -212,21 +222,25 @@ Missing scopes are detected and shown in the sidebar so you know what to enable.
 
 ## Configuration
 
-All configuration is managed through the dashboard **Settings** page (no `.env` file needed):
+All configuration is entered in the dashboard **Settings** page (admins only):
 
 | Setting | Required | Description |
 |---------|----------|-------------|
 | Falcon Client ID | Yes | Falcon API client ID (from Falcon Console > API Clients & Keys) |
 | Falcon Client Secret | Yes | Falcon API client secret |
 | Cloud Region | Yes | Your CrowdStrike cloud (US-1, US-2, US-3, EU-1, GOV-1, GOV-2) |
-| LLM Endpoint | No | LLM endpoint URL (`http://localhost:11434` for Ollama, or cloud endpoint) |
+| LLM Endpoint | No | LLM endpoint URL (`http://localhost:11434` for Ollama, or cloud endpoint). Leave blank to run without AI chat |
 | LLM API Key | No | API key for the LLM endpoint (not needed for Ollama) |
 | LLM Provider | No | `anthropic` (default) or `openai` (use `openai` for Ollama) |
 | LLM Model | No | Model name override (e.g. `llama3.2:3b`, `gpt-4o`) |
 
-Settings are stored encrypted in `.falcon_config.enc`. Multiple CID profiles are supported — switch between them from the sidebar.
+Settings are stored encrypted in `.falcon_config.enc`. Multiple CID profiles are supported — admins can switch between them from the sidebar. Switching changes the active CID for the whole dashboard process, so every open session sees the new tenant.
 
-> **Legacy .env migration:** If you have an existing `.env` file, credentials are automatically migrated to encrypted storage on first startup and secrets are blanked from the `.env` file.
+**Data directory** — `.falcon_config.enc`, `.falcon_config.key`, `.falcon_users.json`, and `.falcon_cache.json` live in the project directory by default. Set `FALCON_DIGEST_HOME` to keep them somewhere else.
+
+**Environment-variable mode** — If no encrypted config file exists, the MCP server, CLI client, and cache daemon read `FALCON_CLIENT_ID`, `FALCON_CLIENT_SECRET`, `FALCON_BASE_URL`, and `LLM_*` from the process environment (for example, set by an IDE's MCP server config). Once a config file exists, it takes precedence.
+
+> **Legacy .env migration:** On first start, if there is no encrypted config and `.env` contains `FALCON_CLIENT_ID` and `FALCON_CLIENT_SECRET`, those values (plus any `LLM_*` values) are imported into the encrypted store and `.env` is renamed to `.env.migrated` (0600). Delete `.env.migrated` once you've confirmed the dashboard works — it still contains your plaintext secret.
 
 ## Testing
 
