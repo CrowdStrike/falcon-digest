@@ -18,7 +18,6 @@ MIT License — see LICENSE file for details.
 
 import requests
 import os
-from dotenv import load_dotenv
 import json
 import asyncio
 import logging
@@ -32,8 +31,9 @@ from crwd_mcp_server import (
     validate_config, ConfigError
 )
 from falcon_cache import cache as falcon_cache
+from falcon_secrets import config_store
 
-load_dotenv()
+config_store.inject_to_env()
 
 # Logging
 logger = logging.getLogger("falcon_mcp.client")
@@ -357,9 +357,31 @@ def call_llm(messages, tools=None, system_context=None):
 
     # Prepend cached context as a message pair so the AI has data upfront.
     # We avoid using the "system" payload field since some endpoints may not support it.
+    _is_local = "localhost" in LLM_ENDPOINT or "127.0.0.1" in LLM_ENDPOINT
+
     if system_context:
-        context_messages = [
-            {"role": "user", "content": f"""[Security Data Context]
+        if _is_local:
+            # Simplified prompt for local/small models — short, numbered rules, no tool access
+            prompt_text = f"""[Security Data Context]
+{system_context}
+
+IMPORTANT: Answer ALL questions using ONLY the cached data above. {cache_age_note}
+
+RULES (follow strictly):
+1. You are Falcon Digest, a CrowdStrike security analyst.
+2. Answer ONLY from the cached data above. DO NOT call any tools.
+3. If the cached data does not have what was asked, say what IS available and what is missing.
+4. Never fabricate hostnames, IPs, CVEs, or numbers not in the data above.
+5. Never describe JSON structure. Interpret the data and present findings like a security analyst.
+6. For counts: lead with the bold number, e.g. "**201 Linux hosts** under management."
+7. For briefings: start with "Risk Score: **X/100** (Level)" then use a summary table.
+8. Use markdown tables for any list with 3+ items.
+9. End briefings with 2-3 actionable recommendations.
+10. Only answer CrowdStrike Falcon security questions."""
+            tools = None  # Don't offer tools to local models
+        else:
+            # Full prompt for cloud LLMs (Anthropic, OpenAI) — detailed formatting, grounding, security
+            prompt_text = f"""[Security Data Context]
 {system_context}
 
 IMPORTANT: Answer ALL questions using ONLY the cached data above. {cache_age_note} If data seems stale, mention the cache age in your answer. Do NOT call tools unless the user explicitly asks for live/fresh data.
@@ -418,31 +440,14 @@ You MUST NOT:
 - Include a header count: "Found **N items** matching criteria"
 - Sort by severity (Critical first) or recency (newest first)
 - Cap at 10-20 rows, note if more exist
-- Example columns for alerts: Severity | Tactic/Technique | Product | Status | Time
 
 ## Action / Priority questions ("what should I", "what needs attention", "prioritize")
 - Numbered priority list, most urgent first
 - Each item: severity badge, what it is, why it's urgent, recommended action
-- Group by urgency tier if many items
-
-## Comparison / Trend questions ("are X increasing", "compare", "change")
-- Present before/after or period comparison in a table
-- Call out notable changes with direction indicators
-- If trend data isn't available, state that and offer to fetch fresh data
 
 ## Investigation questions ("tell me about host X", "activity from IP Y")
 - Use tools to fetch specific data - don't guess
 - Present findings in structured sections: Overview, Key Details, Related Activity, Recommendations
-
-## Fleet / Coverage questions ("patch status", "stale hosts", "sensor coverage", "contained hosts")
-- Lead with the total fleet size for context
-- Break down by the relevant dimension (platform, status, freshness)
-- Highlight any concerning numbers (stale hosts, gaps in coverage)
-
-## Yes/No questions ("are we protected", "is host X compromised", "do we have")
-- Answer directly first: "Yes, ..." or "No, ..."
-- Then provide supporting evidence
-- Include the specific numbers backing the answer
 
 ## General rules
 - Always include specific numbers, never vague language like "some" or "several"
@@ -450,8 +455,11 @@ You MUST NOT:
 - Bold key metrics and critical findings
 - Keep responses concise but complete - executives want answers, not filler
 - When data is from cache, use it directly. Only use tools for: specific host lookups, custom time ranges, filters not in cache, IOC investigations
-- If a question cannot be answered from available data, say so clearly and suggest what tool call would help"""},
-            {"role": "assistant", "content": "Understood. I'm Falcon Digest — grounded strictly in CrowdStrike Falcon data. I'll only report facts backed by cached data or live tool results, never speculate or fabricate. How can I help with your security operations?"}
+- If a question cannot be answered from available data, say so clearly and suggest what tool call would help"""
+
+        context_messages = [
+            {"role": "user", "content": prompt_text},
+            {"role": "assistant", "content": "Understood. I will answer from the cached security data and present findings as a security analyst with tables and actionable insights."}
         ]
         messages = context_messages + messages
 

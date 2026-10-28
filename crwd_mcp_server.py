@@ -1723,9 +1723,10 @@ def _get_cloud_security_sync(severity: str, cloud_provider: str, limit: int) -> 
     # Build FQL filter
     filters = []
     if severity:
-        filters.append(f"severity:'{severity}'")
+        filters.append(f"severity:'{sanitize_fql_value(severity)}'")
     if cloud_provider:
-        filters.append(f"cloud_provider:'{cloud_provider}'")
+        filters.append(f"cloud_provider:'{sanitize_fql_value(cloud_provider)}'")
+
     fql_filter = " + ".join(filters) if filters else None
 
     # 1. Combined cloud risks
@@ -2712,6 +2713,15 @@ async def main():
 
 if __name__ == "__main__":
     import sys
+    from falcon_secrets import config_store
+
+    _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not config_store.has_config() and os.path.isfile(_env_path):
+        config_store.migrate_from_env(_env_path)
+        config_store._load()
+
+    config_store.inject_to_env()
+
     try:
         validate_config()
     except ConfigError as e:

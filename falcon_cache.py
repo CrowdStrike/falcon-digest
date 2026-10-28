@@ -18,6 +18,7 @@ MIT License — see LICENSE file for details.
 
 import logging
 import os
+import re
 
 import threading
 import time
@@ -34,10 +35,17 @@ from crwd_mcp_server import (
     get_identity_protection, get_cloud_security, get_exposure_management,
     get_ngsiem_ingestion
 )
+from falcon_secrets import encrypt_cache, decrypt_cache
 
 
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".falcon_cache.json")
 CACHE_BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".falcon_cache_backups")
+
+_PATH_RE = re.compile(r'(/[\w./-]+){3,}')
+
+def _sanitize_error_msg(msg: str, max_len: int = 200) -> str:
+    sanitized = _PATH_RE.sub("[path]", str(msg))
+    return sanitized[:max_len] + "…" if len(sanitized) > max_len else sanitized
 
 
 def _get_cid_fingerprint() -> str:
@@ -252,12 +260,12 @@ class FalconCache:
                 for future in as_completed(futures):
                     key, result = future.result()
                     if isinstance(result, Exception):
-                        self._errors.append(f"{key}: {result}")
+                        self._errors.append(f"{key}: {_sanitize_error_msg(result)}")
                         logger.error(f"Error fetching {key}: {result}")
                         self._refresh_current[key] = "error"
                         with self._lock:
                             self._cache[key] = {
-                                "data": json.dumps({"error": str(result)}),
+                                "data": json.dumps({"error": _sanitize_error_msg(result)}),
                                 "fetched_at": now_ts,
                             }
                     else:
@@ -282,28 +290,49 @@ class FalconCache:
     # ---------- file persistence ----------
 
     def _save_to_file(self):
-        """Atomically write cache dict to JSON file with CID fingerprint."""
+        """Atomically write encrypted cache to file with CID fingerprint."""
         try:
             with self._lock:
                 snapshot = {k: dict(v) for k, v in self._cache.items()}
-            # Wrap with metadata so we can detect CID changes
             payload = {
                 "_meta": {"cid_fingerprint": self._cid_fingerprint},
                 "entries": snapshot,
             }
+            encrypted = encrypt_cache(payload)
             tmp_path = CACHE_FILE + ".tmp"
-            with open(tmp_path, "w") as f:
-                json.dump(payload, f)
+            if encrypted:
+                with open(tmp_path, "wb") as f:
+                    f.write(encrypted)
+            else:
+                with open(tmp_path, "w") as f:
+                    json.dump(payload, f)
             os.replace(tmp_path, CACHE_FILE)
-            logger.debug(f"Cache saved to {CACHE_FILE} ({len(snapshot)} entries)")
+            os.chmod(CACHE_FILE, 0o600)
+            logger.debug(f"Cache saved to {CACHE_FILE} ({len(snapshot)} entries, encrypted={encrypted is not None})")
         except Exception as e:
             logger.error(f"Failed to save cache file: {e}")
 
     def _load_from_file(self) -> bool:
-        """Load cache from JSON file. Clears and backs up if CID changed."""
+        """Load cache from file. Tries encrypted first, falls back to legacy plaintext."""
         try:
-            with open(CACHE_FILE, "r") as f:
-                data = json.load(f)
+            with open(CACHE_FILE, "rb") as f:
+                raw = f.read()
+
+            data = None
+
+            # Try encrypted format first
+            decrypted = decrypt_cache(raw)
+            if decrypted is not None:
+                data = decrypted
+                logger.debug("Cache loaded from encrypted file")
+            else:
+                # Fall back to legacy plaintext JSON
+                try:
+                    data = json.loads(raw)
+                    logger.debug("Cache loaded from plaintext file (legacy)")
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    logger.warning("Cache file is neither valid encrypted nor valid JSON — ignoring")
+                    return False
 
             # Handle new format with _meta
             if isinstance(data, dict) and "_meta" in data:
@@ -324,7 +353,7 @@ class FalconCache:
                 return True
         except FileNotFoundError:
             logger.debug(f"No cache file found at {CACHE_FILE}")
-        except (json.JSONDecodeError, OSError) as e:
+        except OSError as e:
             logger.warning(f"Failed to load cache file: {e}")
         return False
 
@@ -702,10 +731,9 @@ def parse_env_profiles() -> list[dict]:
                 i += 1
                 continue
 
-            # Scan ahead (up to 8 lines) for FALCON_CLIENT_ID/SECRET/BASE_URL
-            # Skip over LLM_ lines and empty lines
+            # Scan ahead (up to 8 lines) for FALCON_CLIENT_ID/BASE_URL
+            # Secrets are not read here — they live in OS keychain
             client_id = None
-            client_secret = None
             base_url = None
             active = None
             line_start = i
@@ -719,9 +747,7 @@ def parse_env_profiles() -> list[dict]:
                     if active is None:
                         active = not is_commented
                 elif "FALCON_CLIENT_SECRET=" in l:
-                    is_commented = l.lstrip().startswith("#")
-                    val = l.lstrip("#").split("=", 1)[1].strip()
-                    client_secret = val
+                    pass
                 elif "FALCON_BASE_URL=" in l:
                     is_commented = l.lstrip().startswith("#")
                     val = l.lstrip("#").split("=", 1)[1].strip()
@@ -755,8 +781,12 @@ def parse_env_profiles() -> list[dict]:
 def switch_env_profile(target_name: str) -> bool:
     """Rewrite .env to activate the profile with `target_name` and comment out others.
 
+    Secrets are loaded from OS keychain when available. Non-secret config
+    (client ID, base URL) is toggled via comment/uncomment in .env.
     Returns True if profile was switched successfully.
     """
+    from falcon_secrets import inject_secret_to_env, keyring_available
+
     if not os.path.exists(ENV_FILE):
         return False
 
@@ -793,8 +823,8 @@ def switch_env_profile(target_name: str) -> bool:
             new_lines.append(line)
             continue
 
-        # For FALCON_ variable lines, comment/uncomment based on target
-        if "FALCON_CLIENT_ID=" in stripped or "FALCON_CLIENT_SECRET=" in stripped or "FALCON_BASE_URL=" in stripped:
+        # For FALCON_ variable lines (except SECRET), comment/uncomment based on target
+        if "FALCON_CLIENT_ID=" in stripped or "FALCON_BASE_URL=" in stripped:
             # Get the raw key=value (strip any leading #)
             raw = stripped.lstrip("#")
             if in_profile == target_name:
@@ -803,6 +833,9 @@ def switch_env_profile(target_name: str) -> bool:
             else:
                 # Comment out: ensure it starts with #
                 new_lines.append("#" + raw + "\n")
+        elif "FALCON_CLIENT_SECRET=" in stripped:
+            # Leave SECRET lines as-is — secrets live in OS keychain
+            new_lines.append(line)
         else:
             new_lines.append(line)
 
@@ -811,10 +844,15 @@ def switch_env_profile(target_name: str) -> bool:
     with open(tmp_path, "w") as f:
         f.writelines(new_lines)
     os.replace(tmp_path, ENV_FILE)
+    os.chmod(ENV_FILE, 0o600)
 
     # Reload env vars
     from dotenv import load_dotenv
     load_dotenv(ENV_FILE, override=True)
+
+    # Inject secret from keychain if available
+    if keyring_available():
+        inject_secret_to_env(target_name)
 
     logger.info(f"Switched active CID profile to: {target_name}")
     return True

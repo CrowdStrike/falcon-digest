@@ -8,6 +8,16 @@ __pycache__/
 .falcon_cache.json
 .falcon_cache.json.tmp
 
+# User credentials (hashed passwords)
+.falcon_users.json
+.falcon_users.json.tmp
+.falcon_users.json.setup
+
+# Encrypted config and key
+.falcon_config.enc
+.falcon_config.enc.tmp
+.falcon_config.key
+
 # IDE
 .idea/
 .vscode/
