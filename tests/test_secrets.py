@@ -30,6 +30,18 @@ from falcon_secrets import (
 
 SECRET = "super-secret-client-secret-value"
 
+# Fake credentials in Falcon's key format, assembled at runtime so secret
+# scanners don't mistake the test source for real keys.
+DUMMY_CID = "0123456789abcdef" * 2
+DUMMY_CID_ALT = "abcdef0123456789" * 2
+LAB_CID = "labid" + "0" * 27 + "1"
+PROD_CID = "prodid" + "0" * 26 + "2"
+MSP_CID = "mspid" + "0" * 27 + "3"
+LAB_SECRET = "dummysecretlab" + "0" * 25 + "1"
+PROD_SECRET = "dummysecretprod" + "0" * 24 + "2"
+MSP_SECRET = "dummysecretmsp" + "0" * 25 + "3"
+EXAMPLE_SECRET = "dummy" + "SeCrEt0123456789" * 2 + "ab"
+
 
 @pytest.fixture(autouse=True)
 def isolated_key(tmp_path, monkeypatch):
@@ -188,7 +200,7 @@ class TestMigration:
 
     def test_full_migration(self, tmp_path, cfg_path, monkeypatch):
         env = self._write_env(tmp_path, (
-            "FALCON_CLIENT_ID=cid-1\n"
+            f"FALCON_CLIENT_ID={DUMMY_CID}\n"
             f"FALCON_CLIENT_SECRET={SECRET}\n"
             "FALCON_BASE_URL=https://api.us-2.crowdstrike.com\n"
             "LLM_ENDPOINT=http://localhost:11434\n"
@@ -203,7 +215,7 @@ class TestMigration:
 
         store2 = ConfigStore(path=cfg_path)
         p = store2.list_profiles()[0]
-        assert p["client_id"] == "cid-1"
+        assert p["client_id"] == DUMMY_CID
         assert p["base_url"] == "https://api.us-2.crowdstrike.com"
         llm = store2.get_llm_config(include_secret=True)
         assert llm["LLM_ENDPOINT"] == "http://localhost:11434"
@@ -213,7 +225,7 @@ class TestMigration:
 
     def test_llm_key_without_endpoint_preserved(self, tmp_path, cfg_path):
         env = self._write_env(tmp_path, (
-            "FALCON_CLIENT_ID=cid-1\n"
+            f"FALCON_CLIENT_ID={DUMMY_CID}\n"
             f"FALCON_CLIENT_SECRET={SECRET}\n"
             "LLM_API_KEY=orphan-key\n"
         ))
@@ -228,7 +240,7 @@ class TestMigration:
         assert os.path.exists(env)
 
     def test_missing_secret_leaves_env_untouched(self, tmp_path, cfg_path):
-        text = "FALCON_CLIENT_ID=cid-1\nFALCON_CLIENT_SECRET=\n"
+        text = f"FALCON_CLIENT_ID={DUMMY_CID}\nFALCON_CLIENT_SECRET=\n"
         env = self._write_env(tmp_path, text)
         store = ConfigStore(path=cfg_path)
         assert store.migrate_from_env(env) is False
@@ -238,7 +250,7 @@ class TestMigration:
     def test_noop_when_config_exists(self, tmp_path, cfg_path):
         store = ConfigStore(path=cfg_path)
         store.save_profile("existing", "cid-0", "sec-0", "https://api.crowdstrike.com")
-        env = self._write_env(tmp_path, f"FALCON_CLIENT_ID=cid-1\nFALCON_CLIENT_SECRET={SECRET}\n")
+        env = self._write_env(tmp_path, f"FALCON_CLIENT_ID={DUMMY_CID}\nFALCON_CLIENT_SECRET={SECRET}\n")
         assert store.migrate_from_env(env) is False
         assert os.path.exists(env)
         assert [p["name"] for p in store.list_profiles()] == ["existing"]
@@ -292,7 +304,7 @@ class TestFileHelpers:
 # Multi-profile legacy migration, key store failures, concurrent key creation
 # ---------------------------------------------------------------------------
 
-LEGACY_MULTI = """# Hosted LLM (previous)
+LEGACY_MULTI = f"""# Hosted LLM (previous)
 #LLM_API_KEY=old-cloud-key
 #LLM_ENDPOINT=https://llm.example.com
 #LLM_PROVIDER=anthropic
@@ -304,55 +316,160 @@ LLM_PROVIDER=openai
 LLM_MODEL=qwen2.5:7b-instruct
 
 #lab-test
-#FALCON_CLIENT_ID=id-lab
-#FALCON_CLIENT_SECRET=secret-lab
+#FALCON_CLIENT_ID={LAB_CID}
+#FALCON_CLIENT_SECRET={LAB_SECRET}
 #FALCON_BASE_URL=https://api.crowdstrike.com
 
 #prod-us2
-FALCON_CLIENT_ID=id-prod
-FALCON_CLIENT_SECRET="secret-prod"
+FALCON_CLIENT_ID={PROD_CID}
+FALCON_CLIENT_SECRET="{PROD_SECRET}"
 FALCON_BASE_URL=https://api.us-2.crowdstrike.com
 
 #msp: someone@example.com
-#FALCON_CLIENT_ID=id-msp
-#FALCON_CLIENT_SECRET=secret-msp
+#FALCON_CLIENT_ID={MSP_CID}
+#FALCON_CLIENT_SECRET={MSP_SECRET}
 #FALCON_BASE_URL=https://api.crowdstrike.com
 """
+
+# Layout of the project's original .env.example: BASE_URL comes after a blank
+# line and region comments, and scope comments sit above the client ID.
+EXAMPLE_LAYOUT = f"""# CrowdStrike Falcon MCP — Environment Variables
+# Recommended additional scopes for full CISO dashboard:
+#   incidents:read       — CrowdScore gauge, Incidents summary
+#   exposure-management:read — External Attack Surface
+
+FALCON_CLIENT_ID={DUMMY_CID_ALT}
+FALCON_CLIENT_SECRET={EXAMPLE_SECRET}
+
+# Your CrowdStrike cloud region:
+#   US-1:   https://api.crowdstrike.com
+#   GOV-1:  https://api.laggar.gcw.crowdstrike.com
+FALCON_BASE_URL=https://api.laggar.gcw.crowdstrike.com
+
+LLM_ENDPOINT=
+LLM_API_KEY=
+"""
+
+ID = "abcdef0123456789"
+SEC = "abcSECRET1234567890"
+
+
+def _migrate(tmp_path, text):
+    env = tmp_path / ".env"
+    env.write_text(text)
+    store = ConfigStore(path=str(tmp_path / ".falcon_config.enc"))
+    ok = store.migrate_from_env(str(env))
+    return ok, store, env
 
 
 class TestLegacyMultiProfile:
 
-    def test_parse_all_profiles_and_active(self):
-        profiles, active = falcon_secrets.parse_legacy_env_profiles(LEGACY_MULTI)
-        assert list(profiles) == ["lab-test", "prod-us2", "msp: someone@example.com"]
-        assert active == "prod-us2"
-        assert profiles["prod-us2"]["FALCON_CLIENT_SECRET"] == "secret-prod"  # quotes stripped
-        assert profiles["prod-us2"]["FALCON_BASE_URL"] == "https://api.us-2.crowdstrike.com"
-        assert profiles["lab-test"]["FALCON_CLIENT_SECRET"] == "secret-lab"
+    def test_discovers_all_blocks(self):
+        blocks = falcon_secrets.parse_legacy_env_profiles(LEGACY_MULTI)
+        assert [(b["name"], b["active"]) for b in blocks] == [
+            ("lab-test", False), ("prod-us2", True), ("msp: someone@example.com", False)]
+        assert blocks[1]["values"]["FALCON_CLIENT_SECRET"] == PROD_SECRET
 
-    def test_llm_blocks_are_not_profiles(self):
-        profiles, _ = falcon_secrets.parse_legacy_env_profiles(LEGACY_MULTI)
-        assert not any("LLM" in n for n in profiles)
-
-    def test_headerless_active_block_is_default(self):
-        profiles, active = falcon_secrets.parse_legacy_env_profiles(
-            "FALCON_CLIENT_ID=a\nFALCON_CLIENT_SECRET=b\n")
-        assert active == "default" and profiles["default"]["FALCON_CLIENT_ID"] == "a"
-
-    def test_incomplete_profile_skipped(self):
-        profiles, _ = falcon_secrets.parse_legacy_env_profiles("#x\n#FALCON_CLIENT_ID=only-id\n")
-        assert profiles == {}
-
-    def test_migrate_imports_every_profile(self, tmp_path, cfg_path):
-        env = tmp_path / ".env"
-        env.write_text(LEGACY_MULTI)
-        store = ConfigStore(path=cfg_path)
-        assert store.migrate_from_env(str(env)) is True
-        names = {p["name"]: p["active"] for p in ConfigStore(path=cfg_path).list_profiles()}
-        assert names == {"lab-test": False, "prod-us2": True, "msp: someone@example.com": False}
-        llm = ConfigStore(path=cfg_path).get_llm_config(include_secret=True)
+    def test_migrate_imports_every_profile(self, tmp_path):
+        ok, store, env = _migrate(tmp_path, LEGACY_MULTI)
+        assert ok
+        names = {p["name"]: p["active"] for p in ConfigStore(path=store._path).list_profiles()}
+        assert names == {"prod-us2": True, "lab-test": False, "msp: someone@example.com": False}
+        llm = store.get_llm_config(include_secret=True)
         assert llm["LLM_ENDPOINT"] == "http://localhost:11434" and llm["LLM_PROVIDER"] == "openai"
         assert (tmp_path / ".env.migrated").exists() and not env.exists()
+
+    def test_original_example_layout_keeps_region(self, tmp_path):
+        ok, store, _ = _migrate(tmp_path, EXAMPLE_LAYOUT)
+        assert ok
+        profiles = store._data["profiles"]
+        assert list(profiles) == ["default"]  # no scope comment used as a name
+        assert profiles["default"]["FALCON_BASE_URL"] == "https://api.laggar.gcw.crowdstrike.com"
+
+    def test_inline_comment_not_part_of_secret(self, tmp_path):
+        ok, store, _ = _migrate(tmp_path, f"FALCON_CLIENT_ID={ID}\nFALCON_CLIENT_SECRET={SEC}  # prod key\n")
+        assert ok and store._data["profiles"]["default"]["FALCON_CLIENT_SECRET"] == SEC
+
+    def test_export_lines(self, tmp_path):
+        ok, store, _ = _migrate(tmp_path, f"export FALCON_CLIENT_ID={ID}\nexport FALCON_CLIENT_SECRET={SEC}\n")
+        assert ok and store._data["profiles"]["default"]["FALCON_CLIENT_ID"] == ID
+
+    def test_quoted_value_with_comment(self, tmp_path):
+        ok, store, _ = _migrate(tmp_path, f'FALCON_CLIENT_ID="{ID}"\nFALCON_CLIENT_SECRET="{SEC}" # c\n')
+        assert ok and store._data["profiles"]["default"]["FALCON_CLIENT_SECRET"] == SEC
+
+    def test_two_active_blocks_last_wins_first_kept(self, tmp_path):
+        text = (f"#one\nFALCON_CLIENT_ID={ID}1\nFALCON_CLIENT_SECRET={SEC}1\n\n"
+                f"#two\nFALCON_CLIENT_ID={ID}2\nFALCON_CLIENT_SECRET={SEC}2\n")
+        ok, store, _ = _migrate(tmp_path, text)
+        assert ok and store.get_active_profile_name() == "two"
+        assert set(store._data["profiles"]) == {"one", "two"}
+
+    def test_llm_only_env_is_migrated(self, tmp_path):
+        ok, store, env = _migrate(tmp_path, "LLM_ENDPOINT=http://localhost:11434\nLLM_PROVIDER=openai\n")
+        assert ok and not env.exists()
+        assert store.get_llm_config()["LLM_ENDPOINT"] == "http://localhost:11434"
+
+    def test_suspicious_value_keeps_env(self, tmp_path):
+        text = f"FALCON_CLIENT_ID={ID}\nFALCON_CLIENT_SECRET='unterminated\n"
+        ok, store, env = _migrate(tmp_path, text)
+        assert ok is False and env.read_text() == text
+        assert store.migration_warning and not os.path.exists(store._path)
+
+    def test_bad_commented_profile_skipped_not_fatal(self, tmp_path):
+        text = (f"#bad\n#FALCON_CLIENT_ID=x\n#FALCON_CLIENT_SECRET=y\n\n"
+                f"FALCON_CLIENT_ID={ID}\nFALCON_CLIENT_SECRET={SEC}\n")
+        ok, store, _ = _migrate(tmp_path, text)
+        assert ok and list(store._data["profiles"]) == ["default"]
+
+
+class TestConcurrentMutation:
+
+    def test_two_stores_do_not_lose_updates(self, cfg_path):
+        a = ConfigStore(path=cfg_path)
+        b = ConfigStore(path=cfg_path)  # loaded before a's write
+        a.save_profile("alpha", ID + "a", SEC, "https://api.crowdstrike.com")
+        b.save_profile("beta", ID + "b", SEC, "https://api.crowdstrike.com")
+        assert {p["name"] for p in ConfigStore(path=cfg_path).list_profiles()} == {"alpha", "beta"}
+
+    def test_load_error_message_has_no_path(self, cfg_path, monkeypatch):
+        ConfigStore(path=cfg_path).save_profile("p", ID, SEC, "https://api.crowdstrike.com")
+        monkeypatch.setattr(falcon_secrets, "_get_or_create_key", lambda: os.urandom(32))
+        falcon_secrets._reset_key_cache()
+        st = ConfigStore(path=cfg_path)
+        assert st.load_error and cfg_path not in st.load_error and "/" not in st.load_error
+
+
+class TestEnvPrecedence:
+
+    def test_use_env_opt_in(self, cfg_path, monkeypatch):
+        st = ConfigStore(path=cfg_path)
+        st.save_profile("stored", ID, SEC, "https://api.crowdstrike.com")
+        monkeypatch.setitem(falcon_secrets._ENV_AT_START, "FALCON_CLIENT_ID", "ide-supplied-id-123")
+        monkeypatch.setenv("FALCON_DIGEST_USE_ENV", "1")
+        st.inject_to_env()
+        assert os.environ["FALCON_CLIENT_ID"] == "ide-supplied-id-123"
+        monkeypatch.setenv("FALCON_DIGEST_USE_ENV", "0")
+        st.inject_to_env()
+        assert os.environ["FALCON_CLIENT_ID"] == ID
+
+
+class TestKeychainAccount:
+
+    def test_account_is_per_data_dir(self):
+        assert falcon_secrets.KEYRING_ACCOUNT.startswith("encryption-key:")
+        assert len(falcon_secrets.KEYRING_ACCOUNT) > len("encryption-key:")
+
+    def test_key_file_wins_over_keychain(self, tmp_path, monkeypatch):
+        (tmp_path / ".falcon_config.key").write_bytes(b"k" * 32)
+
+        class _Keyring:
+            def get_password(self, *a):
+                raise AssertionError("keychain must not be consulted when a key file exists")
+
+        monkeypatch.setattr(falcon_secrets, "_keyring_available", True)
+        monkeypatch.setattr(falcon_secrets, "_keyring", _Keyring())
+        assert falcon_secrets._get_or_create_key() == b"k" * 32
 
 
 class _BrokenKeyring:

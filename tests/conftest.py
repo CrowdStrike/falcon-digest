@@ -15,9 +15,11 @@ Copyright 2024 CrowdStrike, Inc.
 MIT License — see LICENSE file for details.
 """
 
+import atexit
 import pytest
 import json
 import os
+import shutil
 import tempfile
 from unittest.mock import MagicMock, patch, AsyncMock
 
@@ -25,7 +27,19 @@ from unittest.mock import MagicMock, patch, AsyncMock
 # users and cache files go to a throwaway directory, and the OS keychain is
 # replaced with a backend that always fails, so tests never write real key
 # material into the repo or the developer's login keychain.
-os.environ["FALCON_DIGEST_HOME"] = tempfile.mkdtemp(prefix="falcon-digest-tests-")
+_TEST_HOME = tempfile.mkdtemp(prefix="falcon-digest-tests-")
+os.environ["FALCON_DIGEST_HOME"] = _TEST_HOME
+
+
+def _remove_test_home(path: str = _TEST_HOME) -> None:
+    """Remove the per-run temp data dir — only if it is really a temp dir we created."""
+    real, tmp = os.path.realpath(path), os.path.realpath(tempfile.gettempdir())
+    if (real.startswith(tmp + os.sep) and os.path.basename(real).startswith("falcon-digest-tests-")
+            and not os.path.exists(os.path.join(real, ".git"))):
+        shutil.rmtree(real, ignore_errors=True)
+
+
+atexit.register(_remove_test_home)
 os.environ["PYTHON_KEYRING_BACKEND"] = "keyring.backends.fail.Keyring"
 
 

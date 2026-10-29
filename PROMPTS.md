@@ -12,7 +12,8 @@ Sample prompts used to build this MCP server + dashboard + chat tool with an AI 
 Create a Python MCP server using the `mcp` library (v1.26+) that integrates with CrowdStrike Falcon APIs via FalconPy.
 The server should:
 - Use stdio transport
-- Load credentials from .env (FALCON_CLIENT_ID, FALCON_CLIENT_SECRET, FALCON_BASE_URL)
+- Load credentials (FALCON_CLIENT_ID, FALCON_CLIENT_SECRET, FALCON_BASE_URL) from the process environment, never from files committed to the repo
+  (in the finished project they come from the encrypted config store entered via the dashboard Settings page; see README)
 - Implement a reusable get_falcon_client() function that caches authenticated FalconPy service class instances
 - Include proper logging with a "falcon_mcp" logger
 ```

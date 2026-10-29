@@ -58,6 +58,12 @@ def _llm_settings() -> dict:
 # Retry configuration
 MAX_RETRIES = 3
 RETRY_BACKOFF = [1, 2, 4]
+REQUEST_TIMEOUT_SECONDS = 300
+TURN_TIME_BUDGET_SECONDS = 120  # total wall-clock budget for one chat turn (all LLM calls)
+
+
+class LLMTimeoutError(Exception):
+    """Raised when a chat turn exceeds its time budget."""
 
 # Connection-pooled HTTP session
 _session = requests.Session()
@@ -220,6 +226,32 @@ def _is_local_endpoint(endpoint: str) -> bool:
     return ip.is_loopback or ip.is_private or ip.is_unspecified or ip.is_link_local
 
 
+def _use_local_mode(endpoint: str) -> bool:
+    """Decide whether to use the simplified, tool-free prompt for small local models.
+
+    Controlled by ``LLM_LOCAL_MODE``: ``local`` always, ``full`` never, and
+    ``auto`` (default; also used for unknown values) applies the
+    ``_is_local_endpoint`` heuristic.
+
+    Args:
+        endpoint: LLM endpoint URL.
+
+    Returns:
+        True if the local-model prompt (no tools) should be used.
+    """
+    mode = os.getenv("LLM_LOCAL_MODE", "auto").strip().lower()
+    if mode == "local":
+        return True
+    if mode == "full":
+        return False
+    return _is_local_endpoint(endpoint)
+
+
+def _remaining(deadline: float | None) -> float | None:
+    """Seconds left before ``deadline`` (a ``time.monotonic()`` value), or None if unbounded."""
+    return None if deadline is None else deadline - time.monotonic()
+
+
 def _default_model() -> str:
     """Return the configured model name, falling back to provider defaults.
 
@@ -351,7 +383,7 @@ def _from_openai_response(data):
     }
 
 
-def call_llm(messages, tools=None, system_context=None) -> dict:
+def call_llm(messages, tools=None, system_context=None, *, deadline: float | None = None) -> dict:
     """Call the configured LLM endpoint.
 
     The LLM configuration is read from the environment on every call, so
@@ -362,12 +394,16 @@ def call_llm(messages, tools=None, system_context=None) -> dict:
         tools: Optional tool definitions.
         system_context: Optional cached data context to prepend. If None and
             the cache is running, the cached summary is injected automatically.
+        deadline: Optional absolute ``time.monotonic()`` deadline for this
+            call, including retries. Each request's timeout and every retry
+            sleep are capped by the time remaining.
 
     Returns:
         The LLM response in native (Anthropic Messages) format.
 
     Raises:
         ConfigError: If the LLM endpoint or provider is not configured.
+        LLMTimeoutError: If ``deadline`` passes before a response arrives.
     """
     validate_llm_config()
     settings = _llm_settings()
@@ -397,7 +433,7 @@ def call_llm(messages, tools=None, system_context=None) -> dict:
 
     # Prepend cached context as a message pair so the AI has data upfront.
     # We avoid using the "system" payload field since some endpoints may not support it.
-    _is_local = _is_local_endpoint(endpoint)
+    _is_local = _use_local_mode(endpoint)
     if _is_local:
         tools = None  # Small local models handle tool definitions poorly; answer from cache only
 
@@ -425,7 +461,7 @@ RULES (follow strictly):
             prompt_text = f"""[Security Data Context]
 {system_context}
 
-IMPORTANT: Answer ALL questions using ONLY the cached data above. {cache_age_note} If data seems stale, mention the cache age in your answer. Do NOT call tools unless the user explicitly asks for live/fresh data.
+IMPORTANT: Answer from the cached data above by default. {cache_age_note} If data seems stale, mention the cache age in your answer. Call tools only when the user asks for live/fresh data, or when the cache lacks what the question needs (specific host lookups, custom time ranges or filters, IOC investigations).
 If the cached data does not contain enough detail to fully answer a question, answer with what IS available and be specific about what's missing (e.g., "The cache has <N> Linux hosts but no per-host alert breakdown. Here's what I can tell you from the data I have: ..."). Never give a vague non-answer.
 
 # Identity & Boundaries
@@ -462,9 +498,9 @@ You MUST NOT:
 # Response Formatting Rules
 
 ## Count / "How many" questions
-- Lead with the exact number in bold: **42 hosts** currently managed
+- Lead with the exact number from the data in bold: **<N> hosts** currently managed
 - Follow with a brief breakdown if relevant (e.g. by platform, severity, status)
-- Example: "There are **1,247 hosts** under management: Windows: 892, Mac: 234, Linux: 121"
+- Example shape: "There are **<N> hosts** under management: Windows: <n>, Mac: <n>, Linux: <n>" (use the real numbers from the data)
 
 ## Summary / Briefing / Posture questions
 - Start with an overall risk assessment line: "Risk Score: **X/100** (Level)"
@@ -474,7 +510,7 @@ You MUST NOT:
 - Example format:
   | Metric | Count | Critical | High | Medium | Low |
   |--------|-------|----------|------|--------|-----|
-  | Alerts | 156 | 3 | 12 | 45 | 96 |
+  | Alerts | <total> | <n> | <n> | <n> | <n> |
 
 ## List / Detail questions ("show me", "list", "what are")
 - ALWAYS use a markdown table with appropriate columns
@@ -487,7 +523,7 @@ You MUST NOT:
 - Each item: severity badge, what it is, why it's urgent, recommended action
 
 ## Investigation questions ("tell me about host X", "activity from IP Y")
-- Use tools to fetch specific data - don't guess
+- If the cache lacks the specific host/IP/indicator details, use tools to fetch them — don't guess
 - Present findings in structured sections: Overview, Key Details, Related Activity, Recommendations
 
 ## General rules
@@ -495,7 +531,7 @@ You MUST NOT:
 - Use markdown tables for any list of 3+ items with multiple attributes
 - Bold key metrics and critical findings
 - Keep responses concise but complete - executives want answers, not filler
-- When data is from cache, use it directly. Only use tools for: specific host lookups, custom time ranges, filters not in cache, IOC investigations
+- When the cache has the answer, use it directly. Use tools only for live/fresh data requests or what the cache lacks: specific host lookups, custom time ranges, filters not in cache, IOC investigations
 - If a question cannot be answered from available data, say so clearly and suggest what tool call would help"""
 
         context_messages = [
@@ -521,6 +557,21 @@ You MUST NOT:
 
     logger.info("Calling LLM (provider=%s, model=%s, messages=%d)", provider, model, len(messages))
 
+    def _budget(wanted: float) -> float:
+        remaining = _remaining(deadline)
+        if remaining is None:
+            return wanted
+        if remaining <= 0:
+            raise LLMTimeoutError(f"LLM call exceeded time budget ({TURN_TIME_BUDGET_SECONDS}s per chat turn)")
+        return min(wanted, remaining)
+
+    def _backoff(attempt: int) -> None:
+        delay = RETRY_BACKOFF[attempt]
+        remaining = _remaining(deadline)
+        if remaining is not None and remaining <= delay:
+            raise LLMTimeoutError(f"LLM call exceeded time budget ({TURN_TIME_BUDGET_SECONDS}s per chat turn)")
+        time.sleep(delay)
+
     last_error = None
     for attempt in range(MAX_RETRIES):
         try:
@@ -528,11 +579,11 @@ You MUST NOT:
                 f"{endpoint}{url_path}",
                 headers=headers,
                 json=payload,
-                timeout=300
+                timeout=_budget(REQUEST_TIMEOUT_SECONDS)
             )
             if response.status_code >= 500 and attempt < MAX_RETRIES - 1:
                 logger.warning(f"LLM returned {response.status_code}, retrying in {RETRY_BACKOFF[attempt]}s...")
-                time.sleep(RETRY_BACKOFF[attempt])
+                _backoff(attempt)
                 continue
             response.raise_for_status()
             logger.info("LLM responded (status=%d)", response.status_code)
@@ -540,11 +591,16 @@ You MUST NOT:
             if provider == "openai":
                 return _from_openai_response(data)
             return data
-        except requests.exceptions.ConnectionError as e:
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            remaining = _remaining(deadline)
+            if remaining is not None and remaining <= 0:
+                raise LLMTimeoutError(f"LLM call exceeded time budget ({TURN_TIME_BUDGET_SECONDS}s per chat turn)") from e
+            if not isinstance(e, requests.exceptions.ConnectionError):
+                raise  # read timeout without a budget: same behaviour as before
             last_error = e
             if attempt < MAX_RETRIES - 1:
                 logger.warning(f"Connection error, retrying in {RETRY_BACKOFF[attempt]}s...")
-                time.sleep(RETRY_BACKOFF[attempt])
+                _backoff(attempt)
             else:
                 raise
         except requests.exceptions.HTTPError:
@@ -743,9 +799,10 @@ def chat(user_message: str) -> str:
 
     messages = [{"role": "user", "content": user_message}]
     turn_tool_results = []
+    deadline = time.monotonic() + TURN_TIME_BUDGET_SECONDS
 
     print()
-    response = call_llm(messages, TOOL_DEFINITIONS)
+    response = call_llm(messages, TOOL_DEFINITIONS, deadline=deadline)
 
     # Handle tool use
     while response.get("stop_reason") == "tool_use":
@@ -768,7 +825,7 @@ def chat(user_message: str) -> str:
         messages.append({"role": "assistant", "content": response["content"]})
         messages.append({"role": "user", "content": tool_results})
 
-        response = call_llm(messages, TOOL_DEFINITIONS)
+        response = call_llm(messages, TOOL_DEFINITIONS, deadline=deadline)
 
     # Extract final response
     final_text = ""

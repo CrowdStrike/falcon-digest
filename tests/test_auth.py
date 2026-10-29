@@ -51,7 +51,7 @@ class TestUserBasics:
     def test_add_and_authenticate(self, users_path):
         mgr = UserManager(path=users_path)
         assert mgr.add_user("admin1", "correct-horse", role="admin") is None
-        assert mgr.authenticate("admin1", "correct-horse") == {"username": "admin1", "role": "admin"}
+        assert {k: v for k, v in (mgr.authenticate("admin1", "correct-horse") or {}).items() if k != "epoch"} == {"username": "admin1", "role": "admin"}
 
     def test_wrong_password(self, users_path):
         mgr = UserManager(path=users_path)
@@ -73,7 +73,7 @@ class TestUserBasics:
         mgr.add_user("Alice", "password123", role="admin")
         assert mgr.authenticate("Alice", "password123")["username"] == "alice"
         assert mgr.authenticate(" alice ", "password123")["username"] == "alice"
-        assert mgr.get_user("ALICE") == {"username": "alice", "role": "admin"}
+        assert {k: v for k, v in (mgr.get_user("ALICE") or {}).items() if k != "epoch"} == {"username": "alice", "role": "admin"}
 
     def test_unknown_user_returns_none(self, users_path):
         mgr = UserManager(path=users_path)

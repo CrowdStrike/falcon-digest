@@ -114,12 +114,15 @@ def sanitize_fql_value(value: str) -> str:
 # Filesystem paths: POSIX (2+ segments, not part of a URL) and Windows drive paths
 _POSIX_PATH_RE = re.compile(r"(?<![\w:/.])(?:/[\w.\-]+){2,}/?")
 _WINDOWS_PATH_RE = re.compile(r"\b[A-Za-z]:\\(?:[^\\\s'\"]+\\)*[^\\\s'\"]*")
+# Relative paths: 2+ segments ending in a file extension (not part of a URL or absolute path)
+_RELATIVE_PATH_RE = re.compile(r"(?<![\w:/.\-])[\w.\-]+(?:/[\w.\-]+)+\.[A-Za-z][A-Za-z0-9]{0,7}\b(?!/)")
 
 
 def sanitize_error(msg, max_len: int = 200) -> str:
     """Strip filesystem paths from an error message and truncate it for display.
 
-    URLs are left intact; only local POSIX/Windows paths are replaced.
+    URLs are left intact; only local POSIX/Windows paths (absolute, or
+    relative with 2+ segments ending in a file extension) are replaced.
 
     Args:
         msg: Error message or exception.
@@ -130,6 +133,7 @@ def sanitize_error(msg, max_len: int = 200) -> str:
     """
     sanitized = _WINDOWS_PATH_RE.sub("[path]", str(msg))
     sanitized = _POSIX_PATH_RE.sub("[path]", sanitized)
+    sanitized = _RELATIVE_PATH_RE.sub("[path]", sanitized)
     return sanitized[:max_len] + "…" if len(sanitized) > max_len else sanitized
 
 
@@ -1522,7 +1526,7 @@ async def get_ngsiem_ingestion(hours: int = 24) -> str:
                     source_map[src]["events"] += ev_count
                     source_map[src]["bytes"] += ev_bytes
             except Exception as e:
-                result["error"] = f"MSSP child queries failed; parent fallback also failed: {e}"
+                result["error"] = f"MSSP child queries failed; parent fallback also failed: {sanitize_error(e)}"
 
     else:
         # Single CID mode
@@ -1584,7 +1588,7 @@ def _get_identity_protection_sync(limit: int) -> dict:
     try:
         falcon_idp = get_falcon_client(IdentityProtection)
     except Exception as e:
-        result["error"] = f"Failed to initialize Identity Protection client: {e}"
+        result["error"] = f"Failed to initialize Identity Protection client: {sanitize_error(e)}"
         return result
 
     # 1. Sensor count
@@ -1742,7 +1746,7 @@ def _get_cloud_security_sync(severity: str, cloud_provider: str, limit: int) -> 
     try:
         falcon_cs = get_falcon_client(CloudSecurity)
     except Exception as e:
-        result["error"] = f"Failed to initialize Cloud Security client: {e}"
+        result["error"] = f"Failed to initialize Cloud Security client: {sanitize_error(e)}"
         return result
 
     # Build FQL filter
@@ -1795,7 +1799,7 @@ def _get_cloud_security_sync(severity: str, cloud_provider: str, limit: int) -> 
         else:
             result["error"] = f"Cloud Security API returned {resp['status_code']}"
     except Exception as e:
-        result["error"] = f"Cloud Security query failed: {e}"
+        result["error"] = f"Cloud Security query failed: {sanitize_error(e)}"
         logger.error(f"Cloud Security combined_cloud_risks failed: {e}", exc_info=True)
 
     # 2. IOM count (optional — separate service class)
@@ -1833,7 +1837,7 @@ def _get_exposure_management_sync(limit: int) -> dict:
     try:
         falcon_em = get_falcon_client(ExposureManagement)
     except Exception as e:
-        result["error"] = f"Failed to initialize Exposure Management client: {e}"
+        result["error"] = f"Failed to initialize Exposure Management client: {sanitize_error(e)}"
         return result
 
     # 1. Total assets count

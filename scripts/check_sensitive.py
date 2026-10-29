@@ -77,8 +77,13 @@ def _local_values() -> dict:
     """Collect real values configured on this machine (never printed)."""
     needles: dict[str, str] = {}
     env_line = re.compile(r"^#?\s*([A-Z_]+)\s*=\s*(.*)$")
-    for name in (".env", ".env.migrated"):
-        path = os.path.join(REPO, name)
+    try:
+        sys.path.insert(0, REPO)
+        from falcon_secrets import APP_DIR as data_dir
+    except Exception:
+        data_dir = os.path.expanduser(os.environ.get("FALCON_DIGEST_HOME") or "~/.falcon-digest")
+    for path in (os.path.join(REPO, ".env"), os.path.join(REPO, ".env.migrated"), os.path.join(data_dir, ".env.migrated")):
+        name = os.path.basename(path)
         if not os.path.isfile(path):
             continue
         for line in open(path, errors="replace"):
@@ -90,8 +95,6 @@ def _local_values() -> dict:
 
     # Encrypted config store (profile names, client IDs, secrets, LLM key/endpoint)
     try:
-        sys.path.insert(0, REPO)
-        os.environ.setdefault("FALCON_DIGEST_HOME", REPO)
         from falcon_secrets import ConfigStore, CONFIG_FILE
         if os.path.isfile(CONFIG_FILE):
             store = ConfigStore(CONFIG_FILE)
@@ -107,7 +110,7 @@ def _local_values() -> dict:
     except Exception as e:  # missing deps or unreadable config: still run the other checks
         print(f"  (note: encrypted config not checked: {type(e).__name__})", file=sys.stderr)
 
-    users = os.path.join(REPO, ".falcon_users.json")
+    users = os.path.join(data_dir, ".falcon_users.json")
     if os.path.isfile(users):
         try:
             for u in json.load(open(users)).get("users", {}):

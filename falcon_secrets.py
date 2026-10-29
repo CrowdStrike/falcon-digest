@@ -33,17 +33,59 @@ from cryptography.fernet import Fernet, InvalidToken
 
 logger = logging.getLogger("falcon_mcp.secrets")
 
-# All local state (config, key, users, cache) lives here. Override with
-# FALCON_DIGEST_HOME to keep state outside the source tree (also used by tests).
-APP_DIR = os.environ.get("FALCON_DIGEST_HOME") or os.path.dirname(os.path.abspath(__file__))
+SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_APP_DIR = os.path.join(os.path.expanduser("~"), ".falcon-digest")
+
+# All local state (config, key, users, cache) lives here — never in the source
+# tree, so nothing that operates on the code (git, tests, tools) can touch it.
+# Override with FALCON_DIGEST_HOME (tests point it at a temp dir).
+APP_DIR = os.path.abspath(os.path.expanduser(os.environ.get("FALCON_DIGEST_HOME") or DEFAULT_APP_DIR))
+
+# State file names, used for the one-time move out of the source tree and by
+# the test-only cleanup helper. Only these are ever moved or removed.
+STATE_FILES = (
+    ".falcon_config.enc", ".falcon_config.key", ".falcon_config.lock", ".falcon_config.enc.lock",
+    ".falcon_users.json", ".falcon_users.json.lock", ".falcon_users.json.setup",
+    ".falcon_cache.json", ".env.migrated",
+)
+STATE_DIRS = (".falcon_cache_backups",)
+
+
+def _is_within(path: str, parent: str) -> bool:
+    path, parent = os.path.realpath(path), os.path.realpath(parent)
+    return path == parent or path.startswith(parent.rstrip(os.sep) + os.sep)
+
+
+def _refuse_unsafe_test_run() -> None:
+    """Fail closed if test code is loaded while the data dir is not a temp dir.
+
+    Tests set FALCON_DIGEST_HOME to a temp dir in tests/conftest.py. If test
+    modules are imported any other way (e.g. ``python -c "import test_x"``),
+    that never happens and the real data dir would be used — refuse instead.
+    """
+    import sys
+    if "pytest" not in sys.modules and "PYTEST_CURRENT_TEST" not in os.environ:
+        return
+    import tempfile
+    if not _is_within(APP_DIR, tempfile.gettempdir()):
+        raise RuntimeError(
+            f"Refusing to run tests against a non-temporary data directory ({APP_DIR}). "
+            "Run tests only via `pytest` from the repo, which isolates FALCON_DIGEST_HOME."
+        )
+
+
+_refuse_unsafe_test_run()
+os.makedirs(APP_DIR, mode=0o700, exist_ok=True)
 KEYRING_SERVICE = "falcon-digest"
+# One keychain entry per data directory, so separate installs/FALCON_DIGEST_HOMEs never share a key
+KEYRING_ACCOUNT = "encryption-key:" + __import__("hashlib").sha256(os.path.realpath(APP_DIR).encode()).hexdigest()[:16]
 CONFIG_FILE = os.path.join(APP_DIR, ".falcon_config.enc")
-LEGACY_ENV_FILE = os.path.join(APP_DIR, ".env")
+LEGACY_ENV_FILE = os.path.join(SOURCE_DIR, ".env")
 _KEY_FILE = os.path.join(APP_DIR, ".falcon_config.key")
 _KEY_LOCK_FILE = os.path.join(APP_DIR, ".falcon_config.lock")
 
 _FALCON_KEYS = ("FALCON_CLIENT_ID", "FALCON_CLIENT_SECRET", "FALCON_BASE_URL")
-_LLM_KEYS = ("LLM_ENDPOINT", "LLM_API_KEY", "LLM_PROVIDER", "LLM_MODEL")
+_LLM_KEYS = ("LLM_ENDPOINT", "LLM_API_KEY", "LLM_PROVIDER", "LLM_MODEL", "LLM_LOCAL_MODE")
 
 CLOUD_REGIONS = {
     "US-1": "https://api.crowdstrike.com",
@@ -83,6 +125,12 @@ def write_private_file(path: str, data: bytes) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
+        if hasattr(os, "O_DIRECTORY"):
+            dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
     except BaseException:
         try:
             os.remove(tmp_path)
@@ -124,38 +172,26 @@ _fernet: Fernet | None = None
 _fernet_lock = threading.Lock()
 
 
-@contextlib.contextmanager
-def _key_creation_lock():
-    """Serialize first-time key creation across processes (best effort on Windows)."""
-    if fcntl is None:
-        yield
-        return
-    fd = os.open(_KEY_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-
-
 def _read_existing_key() -> bytes | None:
     """Return the stored key, or None if none exists.
+
+    A key file in the data directory wins over the keychain; the keychain
+    entry is specific to this data directory.
 
     Raises:
         KeyUnavailableError: If the keychain lookup itself failed, so it is
             unknown whether a key exists.
     """
+    if os.path.isfile(_KEY_FILE):
+        with open(_KEY_FILE, "rb") as f:
+            return f.read()
     if _keyring_available and _keyring:
         try:
-            stored = _keyring.get_password(KEYRING_SERVICE, "encryption-key")
+            stored = _keyring.get_password(KEYRING_SERVICE, KEYRING_ACCOUNT)
         except Exception as e:
             raise KeyUnavailableError(f"OS keychain lookup failed ({type(e).__name__}); not creating a new key") from e
         if stored:
             return base64.urlsafe_b64decode(stored)
-    if os.path.isfile(_KEY_FILE):
-        with open(_KEY_FILE, "rb") as f:
-            return f.read()
     return None
 
 
@@ -179,7 +215,7 @@ def _get_or_create_key() -> bytes:
     if key:
         return key
 
-    with _key_creation_lock():
+    with _file_lock(_KEY_LOCK_FILE):
         key = _read_existing_key()  # another process may have created it meanwhile
         if key:
             return key
@@ -192,7 +228,7 @@ def _get_or_create_key() -> bytes:
         stored_in_keychain = False
         if _keyring_available and _keyring:
             try:
-                _keyring.set_password(KEYRING_SERVICE, "encryption-key", base64.urlsafe_b64encode(key).decode())
+                _keyring.set_password(KEYRING_SERVICE, KEYRING_ACCOUNT, base64.urlsafe_b64encode(key).decode())
                 stored_in_keychain = True
                 logger.info("Encryption key stored in OS keychain")
             except Exception:
@@ -232,8 +268,35 @@ def _empty_config() -> dict:
             "LLM_API_KEY": "",
             "LLM_PROVIDER": "anthropic",
             "LLM_MODEL": "",
+            "LLM_LOCAL_MODE": "auto",
         },
     }
+
+
+LLM_LOCAL_MODES = ("auto", "local", "full")
+
+# Values present in the environment before this module touched it (IDE / MCP
+# client supplied). With FALCON_DIGEST_USE_ENV=1 these win over the stored config.
+_ENV_AT_START = {k: os.environ.get(k) for k in _FALCON_KEYS + _LLM_KEYS}
+
+
+def _env_overrides_enabled() -> bool:
+    return os.environ.get("FALCON_DIGEST_USE_ENV", "").strip().lower() in ("1", "true", "yes")
+
+
+@contextlib.contextmanager
+def _file_lock(lock_path: str):
+    """Exclusive inter-process lock on ``lock_path`` (best effort on Windows)."""
+    if fcntl is None:
+        yield
+        return
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 class ConfigStore:
@@ -241,42 +304,69 @@ class ConfigStore:
 
     If the config file exists but cannot be decrypted, ``load_error`` is set
     and all writes are refused, so a process that can't see the right key
-    never overwrites the real config.
+    never overwrites the real config. Every mutation re-reads the file under
+    an inter-process lock first, so concurrent sessions/processes don't lose
+    each other's changes.
     """
 
     def __init__(self, path: str = CONFIG_FILE):
         self._path = path
+        self._lock = threading.RLock()
         self._data: dict = _empty_config()
         self.load_error: str | None = None
+        self.migration_warning: str | None = None
         self.reload()
 
     def reload(self) -> None:
         """Re-read the config from disk (picks up changes from other processes)."""
-        self.load_error = None
-        if not os.path.isfile(self._path):
-            self._data = _empty_config()
-            return
-        try:
-            with open(self._path, "rb") as f:
-                encrypted = f.read()
-            data = json.loads(_get_fernet().decrypt(encrypted))
-            if not isinstance(data, dict):
-                raise ValueError("config root is not an object")
-            merged = _empty_config()
-            merged.update(data)
-            self._data = merged
-        except (InvalidToken, ValueError, OSError, ConfigDecryptError) as e:
-            msg = str(e) or type(e).__name__
-            if isinstance(e, InvalidToken):
-                msg = "the encryption key does not match this config file"
-            self.load_error = f"Cannot read encrypted config ({msg})."
-            logger.error(self.load_error)
+        with self._lock:
+            self.load_error = None
+            if not os.path.isfile(self._path):
+                self._data = _empty_config()
+                return
+            try:
+                with open(self._path, "rb") as f:
+                    encrypted = f.read()
+                data = json.loads(_get_fernet().decrypt(encrypted))
+                if not isinstance(data, dict):
+                    raise ValueError("config root is not an object")
+                merged = _empty_config()
+                merged.update(data)
+                merged["llm"] = {**_empty_config()["llm"], **(data.get("llm") or {})}
+                self._data = merged
+            except KeyUnavailableError as e:
+                self._set_load_error("the OS keychain could not be read", e)
+            except ConfigDecryptError as e:
+                self._set_load_error("its encryption key was not found", e)
+            except InvalidToken as e:
+                self._set_load_error("the encryption key does not match this config file", e)
+            except (ValueError, OSError) as e:
+                self._set_load_error("the file is damaged or unreadable", e)
+
+    def _set_load_error(self, reason: str, exc: Exception) -> None:
+        # User-facing text stays generic (no paths); details go to the server log
+        self.load_error = f"Cannot read the encrypted config: {reason}."
+        logger.error("Failed to load %s: %s", self._path, exc)
+
+    @contextlib.contextmanager
+    def _mutation(self):
+        """Lock, re-read the latest config, let the caller mutate, then save."""
+        with self._lock, _file_lock(self._path + ".lock"):
+            self.reload()
+            if self.load_error:
+                raise ConfigDecryptError(self.load_error)
+            yield self._data
+            self._save()
 
     def _save(self) -> None:
         if self.load_error:
             raise ConfigDecryptError(self.load_error)
         encrypted = _get_fernet().encrypt(json.dumps(self._data).encode())
         write_private_file(self._path, encrypted)
+
+    def exists(self) -> bool:
+        """Return True if a config file exists (even one without profiles)."""
+        return os.path.isfile(self._path)
 
     def has_config(self) -> bool:
         """Return True if at least one Falcon profile is stored."""
@@ -294,15 +384,18 @@ class ConfigStore:
         Returns:
             Dicts with name, client_id, client_id_short, base_url and active.
         """
+        with self._lock:
+            profiles = dict(self._data.get("profiles", {}))
+            active = self._data.get("active_profile")
         results = []
-        for name, p in self._data.get("profiles", {}).items():
+        for name, p in profiles.items():
             client_id = p.get("FALCON_CLIENT_ID", "")
             results.append({
                 "name": name,
                 "client_id": client_id,
                 "client_id_short": client_id[-8:],
                 "base_url": p.get("FALCON_BASE_URL", ""),
-                "active": name == self._data.get("active_profile"),
+                "active": name == active,
             })
         return results
 
@@ -322,31 +415,32 @@ class ConfigStore:
 
         Raises:
             ValueError: If a required value is missing.
+            ConfigDecryptError: If the existing config can't be read.
         """
         name = name.strip()
         client_id = client_id.strip()
         client_secret = client_secret.strip()
-        existing = self._data.get("profiles", {}).get(name, {})
-        if not client_secret:
-            client_secret = existing.get("FALCON_CLIENT_SECRET", "")
-        if not name or not client_id or not client_secret:
-            raise ValueError("Profile name, Client ID, and Client Secret are required.")
-        self._data.setdefault("profiles", {})[name] = {
-            "FALCON_CLIENT_ID": client_id,
-            "FALCON_CLIENT_SECRET": client_secret,
-            "FALCON_BASE_URL": base_url.strip(),
-        }
-        if not self._data.get("active_profile"):
-            self._data["active_profile"] = name
-        self._save()
+        with self._mutation() as data:
+            existing = data.get("profiles", {}).get(name, {})
+            if not client_secret:
+                client_secret = existing.get("FALCON_CLIENT_SECRET", "")
+            if not name or not client_id or not client_secret:
+                raise ValueError("Profile name, Client ID, and Client Secret are required.")
+            data.setdefault("profiles", {})[name] = {
+                "FALCON_CLIENT_ID": client_id,
+                "FALCON_CLIENT_SECRET": client_secret,
+                "FALCON_BASE_URL": base_url.strip(),
+            }
+            if not data.get("active_profile"):
+                data["active_profile"] = name
 
     def delete_profile(self, name: str) -> None:
         """Delete a profile. If it was active, the first remaining one becomes active."""
-        self._data.get("profiles", {}).pop(name, None)
-        if self._data.get("active_profile") == name:
-            remaining = list(self._data.get("profiles", {}).keys())
-            self._data["active_profile"] = remaining[0] if remaining else ""
-        self._save()
+        with self._mutation() as data:
+            data.get("profiles", {}).pop(name, None)
+            if data.get("active_profile") == name:
+                remaining = list(data.get("profiles", {}).keys())
+                data["active_profile"] = remaining[0] if remaining else ""
 
     def set_active_profile(self, name: str) -> bool:
         """Make a profile active.
@@ -354,10 +448,10 @@ class ConfigStore:
         Returns:
             True if the profile exists and is now active.
         """
-        if name not in self._data.get("profiles", {}):
-            return False
-        self._data["active_profile"] = name
-        self._save()
+        with self._mutation() as data:
+            if name not in data.get("profiles", {}):
+                return False
+            data["active_profile"] = name
         return True
 
     # ---- LLM config ----
@@ -369,13 +463,13 @@ class ConfigStore:
             include_secret: Include the API key value. When False, the key is
                 replaced by ``LLM_API_KEY_SET`` (bool) so it can't leak into UI.
         """
-        llm = dict(self._data.get("llm", {}))
+        llm = {**_empty_config()["llm"], **self._data.get("llm", {})}
         if not include_secret:
             llm["LLM_API_KEY_SET"] = bool(llm.pop("LLM_API_KEY", ""))
         return llm
 
     def save_llm_config(self, endpoint: str, api_key: str | None, provider: str = "anthropic",
-                        model: str = "") -> None:
+                        model: str = "", local_mode: str | None = None) -> None:
         """Store LLM settings.
 
         Args:
@@ -383,15 +477,18 @@ class ConfigStore:
             api_key: API key. ``None`` keeps the stored key; ``""`` clears it.
             provider: ``anthropic`` or ``openai``.
             model: Optional model override.
+            local_mode: ``auto``, ``local`` or ``full``; ``None`` keeps the stored value.
         """
-        current = self._data.get("llm", {})
-        self._data["llm"] = {
-            "LLM_ENDPOINT": endpoint.strip(),
-            "LLM_API_KEY": current.get("LLM_API_KEY", "") if api_key is None else api_key.strip(),
-            "LLM_PROVIDER": (provider or "anthropic").strip().lower(),
-            "LLM_MODEL": model.strip(),
-        }
-        self._save()
+        with self._mutation() as data:
+            current = {**_empty_config()["llm"], **data.get("llm", {})}
+            mode = current["LLM_LOCAL_MODE"] if local_mode is None else local_mode.strip().lower()
+            data["llm"] = {
+                "LLM_ENDPOINT": endpoint.strip(),
+                "LLM_API_KEY": current.get("LLM_API_KEY", "") if api_key is None else api_key.strip(),
+                "LLM_PROVIDER": (provider or "anthropic").strip().lower(),
+                "LLM_MODEL": model.strip(),
+                "LLM_LOCAL_MODE": mode if mode in LLM_LOCAL_MODES else "auto",
+            }
 
     # ---- Environment injection ----
 
@@ -401,14 +498,21 @@ class ConfigStore:
         Values that are empty in the stored config are removed from the
         environment so stale credentials don't linger. If no config file
         exists, the environment is left untouched (env-var mode, e.g. an MCP
-        server launched by an IDE with credentials in its environment).
+        server launched by an IDE with credentials in its environment). With
+        ``FALCON_DIGEST_USE_ENV=1``, values that were already in the process
+        environment at startup take precedence over the stored config.
         """
-        if not os.path.isfile(self._path) or self.load_error:
-            return
-        profile = self._data.get("profiles", {}).get(self._data.get("active_profile", ""), {})
-        llm = self._data.get("llm", {})
+        with self._lock:
+            if not os.path.isfile(self._path) or self.load_error:
+                return
+            profile = dict(self._data.get("profiles", {}).get(self._data.get("active_profile", ""), {}))
+            llm = dict(self._data.get("llm", {}))
+        use_env = _env_overrides_enabled()
         for keys, source in ((_FALCON_KEYS, profile), (_LLM_KEYS, llm)):
             for key in keys:
+                if use_env and _ENV_AT_START.get(key):
+                    os.environ[key] = _ENV_AT_START[key]
+                    continue
                 val = (source.get(key) or "").strip()
                 if val:
                     os.environ[key] = val
@@ -420,12 +524,12 @@ class ConfigStore:
     def migrate_from_env(self, env_path: str = LEGACY_ENV_FILE) -> bool:
         """One-time import of credentials from a legacy ``.env`` file.
 
-        Imports every CID profile in the legacy comment/uncomment format
-        (a ``#name`` header followed by ``FALCON_*`` lines, commented out for
-        inactive profiles), keeps the uncommented one active, and imports the
-        active LLM settings. On success the file is renamed to
-        ``.env.migrated`` (0600) so it is no longer read anywhere; the user
-        should delete it once verified.
+        The active profile and LLM settings are read with python-dotenv,
+        exactly as the old runtime read them (``export``, quotes and inline
+        comments behave the same). Commented-out ``#name`` profile blocks are
+        imported too. If any value looks inconsistent, nothing is renamed and
+        ``migration_warning`` explains why; otherwise ``.env`` is renamed to
+        ``.env.migrated`` (0600) so it is no longer read anywhere.
 
         Args:
             env_path: Path to the legacy ``.env`` file.
@@ -433,118 +537,185 @@ class ConfigStore:
         Returns:
             True if credentials were migrated.
         """
-        if self.has_config() or self.load_error or not os.path.isfile(env_path):
-            return False
-
-        with open(env_path, "r", errors="replace") as f:
-            profiles, active = parse_legacy_env_profiles(f.read())
-        if not profiles:
+        if self.exists() or self.load_error or not os.path.isfile(env_path):
             return False
 
         from dotenv import dotenv_values
-        env = dotenv_values(env_path)
+        env = {k: (v or "").strip() for k, v in dotenv_values(env_path).items()}
+        with open(env_path, "r", errors="replace") as f:
+            blocks = parse_legacy_env_profiles(f.read())
 
-        def _get(key: str, default: str = "") -> str:
-            return (env.get(key) or default).strip()
+        profiles: dict[str, dict] = {}
+        problems: list[str] = []
+        active_name = ""
 
-        for name, p in profiles.items():
-            self._data.setdefault("profiles", {})[name] = p
-        self._data["active_profile"] = active or next(iter(profiles))
+        def _unique(name: str) -> str:
+            base, n = name, 2
+            while name in profiles:
+                name, n = f"{base} ({n})", n + 1
+            return name
 
-        llm_endpoint = _get("LLM_ENDPOINT")
-        llm_key = _get("LLM_API_KEY")
-        if llm_endpoint or llm_key:
-            self._data["llm"] = {
-                "LLM_ENDPOINT": llm_endpoint,
-                "LLM_API_KEY": llm_key,
-                "LLM_PROVIDER": _get("LLM_PROVIDER", "anthropic").lower(),
-                "LLM_MODEL": _get("LLM_MODEL"),
+        # Active profile: dotenv's values are authoritative
+        if env.get("FALCON_CLIENT_ID") or env.get("FALCON_CLIENT_SECRET"):
+            active = {
+                "FALCON_CLIENT_ID": env.get("FALCON_CLIENT_ID", ""),
+                "FALCON_CLIENT_SECRET": env.get("FALCON_CLIENT_SECRET", ""),
+                "FALCON_BASE_URL": env.get("FALCON_BASE_URL") or "https://api.crowdstrike.com",
             }
-        self._save()
+            problems += [f"active profile: {p}" for p in _profile_problems(active)]
+            # Name it after the last uncommented block with the same client ID (dotenv: last wins)
+            match = [b for b in blocks if b["active"] and b["values"].get("FALCON_CLIENT_ID") == active["FALCON_CLIENT_ID"]]
+            active_block = match[-1] if match else None
+            active_name = _unique((active_block["name"] if active_block else "") or "default")
+            profiles[active_name] = active
+        else:
+            active_block = None
 
-        migrated_path = env_path + ".migrated"
+        for b in blocks:
+            if b is active_block:
+                continue  # taken from dotenv above
+            values = {
+                "FALCON_CLIENT_ID": b["values"].get("FALCON_CLIENT_ID", ""),
+                "FALCON_CLIENT_SECRET": b["values"].get("FALCON_CLIENT_SECRET", ""),
+                "FALCON_BASE_URL": b["values"].get("FALCON_BASE_URL") or "https://api.crowdstrike.com",
+            }
+            issues = _profile_problems(values)
+            if issues:
+                logger.warning("Skipping commented profile %r from %s: %s", b["name"] or "(unnamed)", env_path, "; ".join(issues))
+                continue
+            profiles[_unique(b["name"] or "imported")] = values
+
+        llm = {k: env.get(k, "") for k in _LLM_KEYS}
+        has_llm = bool(llm["LLM_ENDPOINT"] or llm["LLM_API_KEY"])
+        if not profiles and not has_llm:
+            return False
+        if problems:
+            self.migration_warning = (
+                "Your legacy .env was not imported because some values look inconsistent ("
+                + "; ".join(problems) + "). It was left in place; fix it or enter the profile in Settings."
+            )
+            logger.warning(self.migration_warning)
+            return False
+
+        with self._mutation() as data:
+            data["profiles"] = profiles
+            data["active_profile"] = active_name or next(iter(profiles), "")
+            if has_llm:
+                data["llm"] = {
+                    "LLM_ENDPOINT": llm["LLM_ENDPOINT"],
+                    "LLM_API_KEY": llm["LLM_API_KEY"],
+                    "LLM_PROVIDER": (llm["LLM_PROVIDER"] or "anthropic").lower(),
+                    "LLM_MODEL": llm["LLM_MODEL"],
+                    "LLM_LOCAL_MODE": "auto",
+                }
+
+        # Keep the plaintext leftover in the data dir, never in the source tree
+        migrated_path = os.path.join(os.path.dirname(os.path.abspath(self._path)), ".env.migrated")
+        n = 2
+        while os.path.exists(migrated_path):
+            migrated_path = os.path.join(os.path.dirname(os.path.abspath(self._path)), f".env.migrated.{n}")
+            n += 1
         os.replace(env_path, migrated_path)
         try:
             os.chmod(migrated_path, 0o600)
         except OSError:
             pass
         logger.warning(
-            "Migrated %d CID profile(s) from %s into the encrypted config store. The original file "
+            "Migrated %d CID profile(s)%s from %s into the encrypted config store. The original file "
             "was renamed to %s and still contains plaintext secrets — delete it once verified.",
-            len(profiles), env_path, migrated_path,
+            len(profiles), " and LLM settings" if has_llm else "", env_path, migrated_path,
         )
         return True
 
 
-_LEGACY_LINE_RE = re.compile(r"^(#?)\s*(FALCON_CLIENT_ID|FALCON_CLIENT_SECRET|FALCON_BASE_URL)\s*=\s*(.*)$")
+_LEGACY_VAR_RE = re.compile(r"^\s*#?\s*(?:export\s+)?(FALCON_CLIENT_ID|FALCON_CLIENT_SECRET|FALCON_BASE_URL)\s*=")
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
 
-def _unquote(value: str) -> str:
-    value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        return value[1:-1]
-    return value
+def _profile_problems(values: dict) -> list[str]:
+    """Return reasons a migrated profile looks wrong (empty list if it looks fine)."""
+    problems = []
+    if not _ID_RE.match(values.get("FALCON_CLIENT_ID", "")):
+        problems.append("client ID is missing or has unexpected characters")
+    secret = values.get("FALCON_CLIENT_SECRET", "")
+    if not secret or any(c.isspace() for c in secret) or "#" in secret or secret[:1] in "\"'":
+        problems.append("client secret is missing or contains spaces, '#' or quotes")
+    url = values.get("FALCON_BASE_URL", "")
+    if not url.startswith("https://") or any(c.isspace() for c in url):
+        problems.append("base URL is not an https URL")
+    return problems
 
 
-def parse_legacy_env_profiles(text: str) -> tuple[dict, str]:
-    """Parse CID profiles from the legacy ``.env`` comment/uncomment format.
+def _dotenv_line_value(line: str) -> tuple[str, str] | None:
+    """Parse one ``KEY=value`` line (leading ``#`` removed) with python-dotenv's own parser."""
+    import io
+    from dotenv.parser import parse_stream
+    for binding in parse_stream(io.StringIO(line)):
+        if binding.key:
+            return binding.key, (binding.value or "").strip()
+    return None
 
-    A profile is a comment header line (``#name``) followed by
-    ``FALCON_CLIENT_ID`` / ``FALCON_CLIENT_SECRET`` / ``FALCON_BASE_URL`` lines,
-    commented out (inactive) or not (active). ``FALCON_*`` lines with no
-    header form a profile named ``default``. Profiles missing an ID or secret
-    are skipped.
+
+def parse_legacy_env_profiles(text: str) -> list[dict]:
+    """Discover CID profile blocks in the legacy ``.env`` comment/uncomment format.
+
+    A block starts at a ``FALCON_CLIENT_ID`` line (commented out = inactive)
+    and collects the ``FALCON_CLIENT_SECRET`` / ``FALCON_BASE_URL`` lines that
+    follow, across blank and comment lines, until the next
+    ``FALCON_CLIENT_ID``. The block's name is the comment line *directly*
+    above its ``FALCON_CLIENT_ID`` line (``#prod``); otherwise it is unnamed.
+    Values are parsed with python-dotenv's parser, so ``export``, quotes and
+    inline comments behave exactly as dotenv does.
 
     Args:
         text: Contents of the ``.env`` file.
 
     Returns:
-        ``(profiles, active_name)`` where profiles maps name to stored fields.
+        Blocks as ``{"name", "active", "values"}`` in file order.
     """
-    profiles: dict[str, dict] = {}
-    active = ""
-    header = ""
-    current: dict = {}
-    current_active = False
-
-    def _flush():
-        nonlocal current, current_active, active
-        if current.get("FALCON_CLIENT_ID") and current.get("FALCON_CLIENT_SECRET"):
-            name = header or "default"
-            base, n = name, 2
-            while name in profiles:
-                name, n = f"{base} ({n})", n + 1
-            profiles[name] = {
-                "FALCON_CLIENT_ID": current["FALCON_CLIENT_ID"],
-                "FALCON_CLIENT_SECRET": current["FALCON_CLIENT_SECRET"],
-                "FALCON_BASE_URL": current.get("FALCON_BASE_URL") or "https://api.crowdstrike.com",
-            }
-            if current_active and not active:
-                active = name
-        current, current_active = {}, False
-
+    blocks: list[dict] = []
+    current = None
+    previous = ""
     for raw in text.splitlines():
         line = raw.strip()
-        m = _LEGACY_LINE_RE.match(line)
-        if m:
-            commented, key, value = m.groups()
-            if key in current:  # a repeated key starts a new unnamed block
-                _flush()
-            current[key] = _unquote(value)
-            if key == "FALCON_CLIENT_ID" and not commented:
-                current_active = True
-            continue
-        if not line or (line.startswith("#") and "=" not in line):
-            _flush()
-            if line.startswith("#"):
-                header = line.lstrip("#").strip()
-            continue
-        # any other setting (e.g. LLM_*) ends a profile block
-        _flush()
-        header = ""
-    _flush()
-    return profiles, active
+        if _LEGACY_VAR_RE.match(line):
+            commented = line.startswith("#")
+            parsed = _dotenv_line_value(line.lstrip("#").strip())
+            if parsed:
+                key, value = parsed
+                if key == "FALCON_CLIENT_ID":
+                    name = ""
+                    if previous.startswith("#") and "=" not in previous:
+                        candidate = previous.lstrip("#").strip()
+                        name = candidate if 0 < len(candidate) <= 64 else ""
+                    current = {"name": name, "active": not commented, "values": {}}
+                    blocks.append(current)
+                if current is not None and key not in current["values"]:
+                    current["values"][key] = value
+        previous = line
+    return blocks
 
+
+def _move_legacy_state() -> None:
+    """Move state files left in the source tree by older versions into APP_DIR (by name only).
+
+    Nothing is overwritten: a file is moved only if APP_DIR doesn't already
+    have one with that name.
+    """
+    if _is_within(APP_DIR, SOURCE_DIR) or _is_within(SOURCE_DIR, APP_DIR):
+        return
+    with _file_lock(os.path.join(APP_DIR, ".falcon_config.lock")):
+        for name in STATE_FILES + STATE_DIRS:
+            src, dst = os.path.join(SOURCE_DIR, name), os.path.join(APP_DIR, name)
+            if os.path.lexists(src) and not os.path.lexists(dst):
+                try:
+                    os.replace(src, dst)
+                    logger.warning("Moved %s from the source tree to the data directory %s", name, APP_DIR)
+                except OSError as e:
+                    logger.error("Could not move %s to %s: %s", name, APP_DIR, e)
+
+
+_move_legacy_state()
 
 # Module-level singleton
 config_store = ConfigStore()

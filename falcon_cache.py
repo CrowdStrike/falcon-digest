@@ -40,6 +40,7 @@ from falcon_secrets import APP_DIR, encrypt_cache, decrypt_cache, refresh_env_fr
 
 CACHE_FILE = os.path.join(APP_DIR, ".falcon_cache.json")
 CACHE_BACKUP_DIR = os.path.join(APP_DIR, ".falcon_cache_backups")
+MAX_CACHE_BACKUPS = 5
 
 def _get_cid_fingerprint() -> str:
     """Return a short fingerprint of current credentials for change detection."""
@@ -84,6 +85,7 @@ class FalconCache:
         self._refresh_done = 0      # how many sources completed
         self._refresh_total = 0     # how many sources total
         self._refresh_current = {}  # {key: "pending"|"loading"|"done"|"error"}
+        self._secure_backup_dir()
         self._load_from_file()
 
     # ---------- lifecycle ----------
@@ -313,6 +315,7 @@ class FalconCache:
                 raw = f.read()
 
             data = None
+            was_plaintext = False
 
             # Try encrypted format first
             decrypted = decrypt_cache(raw)
@@ -323,6 +326,7 @@ class FalconCache:
                 # Fall back to legacy plaintext JSON
                 try:
                     data = json.loads(raw)
+                    was_plaintext = True
                     logger.debug("Cache loaded from plaintext file (legacy)")
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     logger.warning("Cache file is neither valid encrypted nor valid JSON — ignoring")
@@ -344,6 +348,13 @@ class FalconCache:
                     self._cache = data
                 self._loaded_from_file = True
                 logger.info(f"Cache loaded from {CACHE_FILE} ({len(data)} entries)")
+                if was_plaintext:
+                    # Upgrade path: don't leave tenant data on disk in plaintext
+                    self._save_to_file()
+                    if decrypt_cache(open(CACHE_FILE, "rb").read()) is None:
+                        logger.warning("Legacy plaintext cache could not be re-encrypted; it is still on disk")
+                    else:
+                        logger.info("Legacy plaintext cache re-encrypted")
                 return True
         except FileNotFoundError:
             logger.debug(f"No cache file found at {CACHE_FILE}")
@@ -351,21 +362,89 @@ class FalconCache:
             logger.warning(f"Failed to load cache file: {e}")
         return False
 
-    def _backup_and_clear_file(self):
-        """Move stale cache file to backup directory."""
+    @staticmethod
+    def _encrypted_backup_bytes(raw: bytes) -> bytes | None:
+        """Return ``raw`` as ciphertext suitable for a backup, or None if it can't be stored safely."""
+        if decrypt_cache(raw) is not None:
+            return raw  # already encrypted with the current key
         try:
-            os.makedirs(CACHE_BACKUP_DIR, exist_ok=True)
-            ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
-            backup_path = os.path.join(CACHE_BACKUP_DIR, f"cache_{ts}.json")
-            os.replace(CACHE_FILE, backup_path)
-            logger.info(f"Old cache backed up to {backup_path}")
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None  # unreadable (e.g. encrypted with an old key) — not worth keeping
+        return encrypt_cache(payload)
+
+    @staticmethod
+    def _prune_backups(keep: int = MAX_CACHE_BACKUPS) -> None:
+        """Delete all but the newest ``keep`` cache backups."""
+        try:
+            files = [os.path.join(CACHE_BACKUP_DIR, n) for n in os.listdir(CACHE_BACKUP_DIR)]
+        except OSError:
+            return
+        files = sorted((f for f in files if os.path.isfile(f)), key=os.path.getmtime, reverse=True)
+        for old in files[keep:]:
+            try:
+                os.remove(old)
+            except OSError as e:
+                logger.warning(f"Failed to prune cache backup: {e}")
+
+    @staticmethod
+    def _secure_backup_dir() -> None:
+        """Encrypt or delete legacy plaintext cache backups and prune old ones (best effort)."""
+        if not os.path.isdir(CACHE_BACKUP_DIR):
+            return
+        try:
+            os.chmod(CACHE_BACKUP_DIR, 0o700)
+            for name in os.listdir(CACHE_BACKUP_DIR):
+                path = os.path.join(CACHE_BACKUP_DIR, name)
+                if not os.path.isfile(path):
+                    continue
+                with open(path, "rb") as f:
+                    raw = f.read()
+                if decrypt_cache(raw) is not None:
+                    continue
+                encrypted = FalconCache._encrypted_backup_bytes(raw)
+                if encrypted is not None:
+                    base = path[:-5] if path.endswith(".json") else path
+                    write_private_file(base + ".enc", encrypted)
+                    if base + ".enc" != path:
+                        os.remove(path)
+                    logger.info(f"Encrypted legacy cache backup {name}")
+                else:
+                    os.remove(path)
+                    logger.info(f"Deleted cache backup {name} that could not be stored encrypted")
+        except Exception as e:
+            logger.warning(f"Failed to secure cache backups: {e}")
+        FalconCache._prune_backups()
+
+    def _backup_and_clear_file(self):
+        """Move the stale cache into the backup directory (encrypted only) and remove it.
+
+        Plaintext legacy caches are encrypted before being backed up; if that
+        isn't possible, the cache is deleted instead. Only the newest
+        ``MAX_CACHE_BACKUPS`` backups are kept.
+        """
+        try:
+            with open(CACHE_FILE, "rb") as f:
+                raw = f.read()
+            encrypted = self._encrypted_backup_bytes(raw)
+            if encrypted is not None:
+                os.makedirs(CACHE_BACKUP_DIR, mode=0o700, exist_ok=True)
+                os.chmod(CACHE_BACKUP_DIR, 0o700)
+                ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+                backup_path = os.path.join(CACHE_BACKUP_DIR, f"cache_{ts}.enc")
+                write_private_file(backup_path, encrypted)
+                logger.info(f"Old cache backed up to {backup_path}")
+            else:
+                logger.info("Old cache could not be stored encrypted — deleting instead of backing up")
+        except FileNotFoundError:
+            return
         except Exception as e:
             logger.warning(f"Failed to backup cache file: {e}")
-            # Still try to remove it
-            try:
-                os.remove(CACHE_FILE)
-            except Exception:
-                pass
+        try:
+            os.remove(CACHE_FILE)
+        except OSError:
+            pass
+        self._prune_backups()
 
     def check_cid_change(self) -> bool:
         """Check if CID changed since cache was initialized. If so, clear everything.

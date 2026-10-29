@@ -126,6 +126,7 @@ Run the AI chat features entirely offline using [Ollama](https://ollama.com) —
    - **Provider**: `openai` (Ollama exposes an OpenAI-compatible API)
    - **Model Override**: `llama3.2:3b` (or whichever model you pulled)
    - **LLM API Key**: leave blank (not needed for Ollama)
+   - **Model type**: `Auto` (default) treats loopback, private-network and `.local` endpoints as small local models. Choose `Local small model` or `Full model (tools)` to override, e.g. for a large model on a private-IP gateway.
 
    The LLM is optional — the dashboard works with Falcon credentials alone. Until an endpoint is set, the AI Chat tab asks you to configure it in Settings.
 
@@ -152,13 +153,14 @@ Run the AI chat features entirely offline using [Ollama](https://ollama.com) —
 ## Security
 
 - **Read-Only Access** — All Falcon API operations are strictly read-only. No RTR, no response actions, no write operations.
-- **Mandatory Authentication** — All dashboard access requires login. Passwords are hashed with PBKDF2-SHA256 (600k iterations, per-user salt) and stored in `.falcon_users.json`. Usernames are case-insensitive, and repeated failed logins trigger a temporary lockout with backoff.
+- **Mandatory Authentication** — All dashboard access requires login. Passwords are hashed with PBKDF2-SHA256 (600k iterations, per-user salt) and stored in `.falcon_users.json`. Usernames are case-insensitive, and repeated failed logins trigger a temporary lockout with backoff, counted per client address. When Streamlit can't see the client IP (localhost, or behind a reverse proxy) the lockout is per browser session, plus a per-username slow-down that never hard-blocks the account. If you put the dashboard behind a reverse proxy, per-IP lockout depends on the proxy passing client addresses.
 - **Protected First-Run Setup** — Creating the first admin requires a one-time setup token, printed to the terminal running `streamlit run` and stored in `.falcon_users.json.setup` (0600). The token is deleted after use. If `.falcon_users.json` exists but is corrupt or unreadable, the dashboard refuses to start instead of reopening setup.
-- **Roles** — Only admins can open Settings, manage users, and switch CID profiles; viewers can only view. Roles are re-checked on every page load, so removing or demoting a user takes effect immediately.
+- **Roles** — Only admins can open Settings, manage users, and switch CID profiles; viewers can only view. Roles are re-checked on every page load and inside interactive panels and callbacks (including AI chat), so removing or demoting a user takes effect immediately.
+- **Sessions** — Changing a user's password or role, or removing the user, ends that user's existing sessions. Sessions expire after 8 hours of inactivity. Logout clears all session data, so the next user in the same browser sees nothing from the previous one.
 - **Secrets Stay Server-Side** — Stored secrets (Falcon client secret, LLM API key) are never sent back to the browser. Leave a secret field blank in Settings to keep the existing value.
-- **Encrypted Configuration** — Credentials are stored in `.falcon_config.enc`, encrypted with Fernet (AES-128-CBC + HMAC-SHA256). The encryption key is kept in the OS keychain (service `falcon-digest`, via the `keyring` library) when available. Otherwise it is written to `.falcon_config.key` (0600) **next to the ciphertext** — in that mode the encryption only guards against casual disclosure (e.g. backups or syncs of just the config file), not against someone who can read the app directory as the same OS user.
+- **Encrypted Configuration** — Credentials are stored in `.falcon_config.enc`, encrypted with Fernet (AES-128-CBC + HMAC-SHA256). The encryption key is kept in the OS keychain (service `falcon-digest`, via the `keyring` library) when available, under an account name derived from the data directory path, so separate installs and `FALCON_DIGEST_HOME` directories never share or overwrite each other's key. If `.falcon_config.key` exists in the data directory it is used in preference to the keychain. Otherwise the key is written to `.falcon_config.key` (0600) **next to the ciphertext** — in that mode the encryption only guards against casual disclosure (e.g. backups or syncs of just the config file), not against someone who can read the app directory as the same OS user.
 - **Fail Closed on Decrypt Errors** — If the config file exists but can't be decrypted (for example, a process that can't reach the keychain, or a lost key), the app shows an error and refuses to overwrite it rather than silently resetting your settings.
-- **Encrypted Cache** — `.falcon_cache.json` is encrypted with the same key. If encryption fails, the cache is not written to disk.
+- **Encrypted Cache** — `.falcon_cache.json` is encrypted with the same key. If encryption fails, the cache is not written to disk. A plaintext cache left by an older version is re-encrypted on first load, and cache backups in `.falcon_cache_backups/` (made when the CID changes) are encrypted and pruned to the newest 5.
 - **Localhost by Default** — `.streamlit/config.toml` binds the dashboard to `127.0.0.1`.
 - **FQL Injection Prevention** — All user-supplied values are sanitized through a character whitelist (`sanitize_fql_value()`) before interpolation into FQL filter strings.
 - **XSS Protection** — API-sourced values rendered via `unsafe_allow_html=True` are escaped with `html.escape()`.
@@ -233,14 +235,17 @@ All configuration is entered in the dashboard **Settings** page (admins only):
 | LLM API Key | No | API key for the LLM endpoint (not needed for Ollama) |
 | LLM Provider | No | `anthropic` (default) or `openai` (use `openai` for Ollama) |
 | LLM Model | No | Model name override (e.g. `llama3.2:3b`, `gpt-4o`) |
+| Model type | No | `Auto` (default), `Local small model` (simplified prompt, no tools) or `Full model (tools)`. Env var `LLM_LOCAL_MODE=auto\|local\|full`. Each chat turn is capped at 120 s in total |
 
 Settings are stored encrypted in `.falcon_config.enc`. Multiple CID profiles are supported — admins can switch between them from the sidebar. Switching changes the active CID for the whole dashboard process, so every open session sees the new tenant.
 
-**Data directory** — `.falcon_config.enc`, `.falcon_config.key`, `.falcon_users.json`, and `.falcon_cache.json` live in the project directory by default. Set `FALCON_DIGEST_HOME` to keep them somewhere else.
+**Data directory** — `.falcon_config.enc`, `.falcon_config.key`, `.falcon_users.json`, and `.falcon_cache.json` live in `~/.falcon-digest/` (created 0700), never in the source tree, so git operations, tests and other tools working on the code can't touch them. Set `FALCON_DIGEST_HOME` to use a different directory. State files left in the project directory by earlier versions are moved there on first start (by name; nothing is overwritten). The test suite always uses a temporary directory and refuses to run against a non-temporary one.
 
-**Environment-variable mode** — If no encrypted config file exists, the MCP server, CLI client, and cache daemon read `FALCON_CLIENT_ID`, `FALCON_CLIENT_SECRET`, `FALCON_BASE_URL`, and `LLM_*` from the process environment (for example, set by an IDE's MCP server config). Once a config file exists, it takes precedence.
+**Environment-variable mode** — If no encrypted config file exists, the MCP server, CLI client, cache daemon and dashboard read `FALCON_CLIENT_ID`, `FALCON_CLIENT_SECRET`, `FALCON_BASE_URL`, and `LLM_*` from the process environment (for example, set by an IDE's MCP server config). In the dashboard, Settings can then be used to create a stored config.
 
-> **Legacy .env migration:** On first start, if there is no encrypted config and `.env` contains `FALCON_CLIENT_ID` and `FALCON_CLIENT_SECRET`, those values (plus any `LLM_*` values) are imported into the encrypted store and `.env` is renamed to `.env.migrated` (0600). Delete `.env.migrated` once you've confirmed the dashboard works — it still contains your plaintext secret.
+**Env vars vs stored config** — By default, once `.falcon_config.enc` exists it takes precedence over the environment. Set `FALCON_DIGEST_USE_ENV=1` to let `FALCON_*` / `LLM_*` variables already present in the process environment win — for example, an MCP server launched by an IDE for a different CID than the dashboard's active profile.
+
+> **Upgrading from a `.env` file:** On first start, if there is no encrypted config, `.env` is imported into the encrypted store. The active profile and the `LLM_*` settings are read with python-dotenv, exactly as earlier versions did (so `export`, quotes and inline comments behave the same), and commented-out `#name` profile blocks from the old multi-profile layout are imported as additional profiles. If anything looks inconsistent, `.env` is left in place and a warning is logged instead. On success `.env` is moved to `~/.falcon-digest/.env.migrated` (0600), out of the source tree. Delete it once you've confirmed the dashboard works — it still contains your plaintext secrets. A plaintext `.falcon_cache.json` from an older version is re-encrypted on first load, and existing cache backups are encrypted and pruned to the newest 5.
 
 ## Testing
 

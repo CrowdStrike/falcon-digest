@@ -35,7 +35,10 @@ from crwd_mcp_server import (
     get_identity_protection, get_cloud_security, get_exposure_management,
     validate_config, validate_llm_config, ConfigError, clear_client_cache
 )
-from mcp_api_client import call_llm, execute_tool, validate_response, TOOL_DEFINITIONS
+from mcp_api_client import (
+    call_llm, execute_tool, validate_response, TOOL_DEFINITIONS,
+    TURN_TIME_BUDGET_SECONDS, LLMTimeoutError,
+)
 from crwd_mcp_server import sanitize_error as _sanitize_error
 from falcon_cache import cache as falcon_cache
 from falcon_auth import UserManager, lockout_remaining
@@ -65,11 +68,73 @@ if _user_mgr.load_error:
     )
     st.stop()
 if config_store.load_error:
+    config_store.reload()  # recovers without a restart once the key is reachable again
+if config_store.load_error:
     st.error(
         f"{config_store.load_error} The dashboard will not overwrite it. Make sure this process "
-        "can reach the same OS keychain or `.falcon_config.key` the config was created with, then reload."
+        "can reach the same OS keychain or key file the config was created with, then reload. "
+        "Details are in the server log."
     )
     st.stop()
+
+_IDLE_TIMEOUT_SECONDS = 8 * 3600
+
+
+def _logout() -> None:
+    """End the session and drop every piece of session data (chat, tab data, flags)."""
+    st.session_state.clear()
+    st.session_state.authenticated = False
+    st.session_state.current_user = None
+
+
+def _client_id() -> str:
+    """Identify the client for login throttling: its IP, else this browser session."""
+    ip = getattr(st.context, "ip_address", None)
+    if isinstance(ip, str) and ip:
+        return ip
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        ctx = get_script_run_ctx()
+        if ctx is not None:
+            return f"session:{ctx.session_id}"
+    except Exception:
+        pass
+    return ""
+
+
+def _require_user(role: str | None = None) -> bool:
+    """Re-validate the logged-in user against the users file.
+
+    Used at the top of every run, inside fragments (which rerun without the
+    module-level gate) and inside widget callbacks (which run before the
+    script, with the previous run's role). Logs the session out if the user
+    was removed, their password/role changed (session version bump) or the
+    session was idle too long.
+
+    Args:
+        role: If ``"admin"``, also require the admin role.
+
+    Returns:
+        True if the session is valid (and has ``role`` if given).
+    """
+    current = st.session_state.get("current_user") or {}
+    if not st.session_state.get("authenticated") or not current:
+        return False
+    fresh = UserManager().get_user(current.get("username", ""))
+    now = time.time()
+    idle = now - st.session_state.get("_last_activity", now)
+    if not fresh or fresh.get("epoch", 0) != current.get("epoch", 0) or idle > _IDLE_TIMEOUT_SECONDS:
+        _logout()
+        return False
+    st.session_state.current_user = fresh
+    st.session_state["_last_activity"] = now
+    return role is None or fresh.get("role") == role
+
+
+def _flash(message: str) -> None:
+    """Queue a success message to show after the next rerun."""
+    st.session_state["_flash"] = message
+
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -110,13 +175,14 @@ if not _user_mgr.has_users():
             elif setup_pw != setup_pw2:
                 st.error("Passwords do not match.")
             else:
-                err = _user_mgr.add_user(setup_user, setup_pw, role="admin")
+                err = _user_mgr.add_user(setup_user, setup_pw, role="admin", require_no_users=True)
                 if err:
                     st.error(err)
                 else:
                     _user_mgr.consume_setup_token()
                     st.session_state.authenticated = True
-                    st.session_state.current_user = _user_mgr.get_user(setup_user)
+                    st.session_state.current_user = UserManager().get_user(setup_user)
+                    st.session_state["_last_activity"] = time.time()
                     st.rerun()
     st.stop()
 
@@ -132,12 +198,13 @@ if not st.session_state.authenticated:
         login_pw = st.text_input("Password", type="password", placeholder="Password")
         submitted = st.form_submit_button("Login", type="primary")
         if submitted:
-            _ip = getattr(st.context, "ip_address", None)
-            _client = _ip if isinstance(_ip, str) else ""
+            _client = _client_id()
             result = _user_mgr.authenticate(login_user, login_pw, client=_client)
             if result:
+                st.session_state.clear()  # nothing from a previous user survives
                 st.session_state.authenticated = True
                 st.session_state.current_user = result
+                st.session_state["_last_activity"] = time.time()
                 st.rerun()
             _wait = lockout_remaining(login_user, _client)
             if _wait:
@@ -146,13 +213,9 @@ if not st.session_state.authenticated:
                 st.error("Invalid username or password.")
     st.stop()
 
-# Re-read the user on every run so removals and role changes apply to live sessions
-_fresh_user = _user_mgr.get_user((st.session_state.current_user or {}).get("username", ""))
-if not _fresh_user:
-    st.session_state.authenticated = False
-    st.session_state.current_user = None
+# Re-validate on every run so removals, role/password changes and idle expiry apply to live sessions
+if not _require_user():
     st.rerun()
-st.session_state.current_user = _fresh_user
 
 
 def _is_admin() -> bool:
@@ -184,6 +247,17 @@ def _apply_config_change() -> bool:
     return False
 
 
+def _on_cid_select() -> None:
+    """Switch the active CID only when this admin actually changes the sidebar selector."""
+    if not _require_user("admin"):
+        return
+    choice = st.session_state.get("cid_profile_select")
+    if choice and choice != config_store.get_active_profile_name():
+        config_store.set_active_profile(choice)
+        _apply_config_change()
+        st.session_state["_cid_switching"] = True
+
+
 def _render_settings_page():
     """Render the Settings page for Falcon API and LLM configuration (admins only)."""
     st.markdown(
@@ -191,9 +265,13 @@ def _render_settings_page():
         '<p style="color:#6B7280;">Configure Falcon API credentials and LLM settings.</p>',
         unsafe_allow_html=True
     )
-    if not _is_admin():
+    if not _require_user("admin"):
         st.info("Only an admin can change settings. Ask an admin to update the configuration.")
         return
+    if st.session_state.get("_flash"):
+        st.success(st.session_state.pop("_flash"))
+    if config_store.migration_warning:
+        st.warning(config_store.migration_warning)
 
     # --- CID Profiles ---
     st.subheader("CrowdStrike Falcon API Profiles")
@@ -229,7 +307,7 @@ def _render_settings_page():
                 st.error(_sanitize_error(e, max_len=400))
             else:
                 _apply_config_change()
-                st.success(f"Profile '{html.escape(profile_name.strip())}' saved.")
+                _flash(f"Profile '{profile_name.strip()}' saved.")
                 st.rerun()
 
     # --- LLM Settings ---
@@ -245,15 +323,22 @@ def _render_settings_page():
         lcol1, lcol2 = st.columns(2)
         llm_provider = lcol1.selectbox("Provider", ["anthropic", "openai"], index=0 if llm.get("LLM_PROVIDER", "anthropic") == "anthropic" else 1)
         llm_model = lcol2.text_input("Model Override", value=llm.get("LLM_MODEL", ""), placeholder="Leave blank for default")
+        _modes = {"auto": "Auto (detect from endpoint)", "local": "Local small model (no tools)", "full": "Full model (tools)"}
+        _mode_keys = list(_modes)
+        llm_local_mode = st.selectbox(
+            "Model type", _mode_keys, format_func=_modes.get,
+            index=_mode_keys.index(llm.get("LLM_LOCAL_MODE", "auto")) if llm.get("LLM_LOCAL_MODE", "auto") in _modes else 0,
+            help="Auto treats loopback, private-network and .local endpoints as small local models.",
+        )
         if st.form_submit_button("Save LLM Settings", type="primary"):
             api_key = "" if clear_key else (llm_key or None)
             try:
-                config_store.save_llm_config(llm_endpoint, api_key, llm_provider, llm_model)
+                config_store.save_llm_config(llm_endpoint, api_key, llm_provider, llm_model, llm_local_mode)
             except ConfigDecryptError as e:
                 st.error(_sanitize_error(e, max_len=400))
             else:
                 config_store.inject_to_env()
-                st.success("LLM settings saved.")
+                _flash("LLM settings saved.")
                 st.rerun()
 
 
@@ -265,16 +350,20 @@ def _render_setup_required(message: str):
     else:
         st.warning(f"{message} Ask an admin to finish the configuration.")
     if st.button("Logout", key="setup_logout_btn"):
-        st.session_state.authenticated = False
-        st.session_state.current_user = None
+        _logout()
         st.rerun()
     st.stop()
 
 
-if not config_store.has_config():
-    _render_setup_required("Add a Falcon API profile to get started.")
-
 config_store.inject_to_env()
+
+_ENV_MODE = False
+if not config_store.has_config():
+    try:
+        validate_config()  # Falcon credentials supplied via the process environment
+        _ENV_MODE = True
+    except ConfigError:
+        _render_setup_required("Add a Falcon API profile to get started.")
 
 try:
     validate_config()
@@ -495,10 +584,15 @@ if "cache_started" not in st.session_state:
         else:
             st.session_state.cache_loaded_from_file = False
             falcon_cache.start(poll_interval=300, ttl=300)
-            # Wait for initial cache load with progress
+            # start() is a no-op if the poller is already running (e.g. the cache was
+            # just cleared by a CID change), so kick a refresh rather than wait for the next poll
+            if not falcon_cache.is_refreshing and falcon_cache.entry_count == 0:
+                falcon_cache.force_refresh()
+            # Wait for initial cache load with progress (bounded, so a stuck fetch can't hang the page)
             _init_progress = st.empty()
             _init_status = st.empty()
-            while falcon_cache.is_refreshing or falcon_cache.entry_count == 0:
+            _init_deadline = time.monotonic() + 120
+            while (falcon_cache.is_refreshing or falcon_cache.entry_count == 0) and time.monotonic() < _init_deadline:
                 pct = falcon_cache.refresh_progress
                 _init_progress.progress(pct, text=f"Loading Falcon data... {int(pct * 100)}%")
                 status = falcon_cache.refresh_status
@@ -857,8 +951,7 @@ with st.sidebar:
         st.caption(f"Logged in as **{html.escape(_cur_user.get('username', ''))}**{_role_badge}")
     with _user_cols[1]:
         if st.button("Logout", key="logout_btn", type="secondary"):
-            st.session_state.authenticated = False
-            st.session_state.current_user = None
+            _logout()
             st.rerun()
 
     st.markdown(
@@ -870,19 +963,19 @@ with st.sidebar:
     _cfg_profiles = config_store.list_profiles()
     if len(_cfg_profiles) > 1 and _is_admin():
         _profile_names = [p["name"] for p in _cfg_profiles]
-        _active_idx = next((i for i, p in enumerate(_cfg_profiles) if p["active"]), 0)
-        selected_profile = st.selectbox(
+        # Always mirror the active profile, so a stale per-session value (e.g. after
+        # Settings -> Activate or another admin's switch) never switches it back
+        st.session_state["cid_profile_select"] = config_store.get_active_profile_name() or _profile_names[0]
+        st.selectbox(
             "CID Profile",
             _profile_names,
-            index=_active_idx,
             format_func=lambda n: next(
                 (f"{p['name']}  ({p['client_id_short']})" for p in _cfg_profiles if p["name"] == n), n
             ),
             key="cid_profile_select",
+            on_change=_on_cid_select,
         )
-        if selected_profile != _cfg_profiles[_active_idx]["name"]:
-            config_store.set_active_profile(selected_profile)
-            _apply_config_change()
+        if st.session_state.pop("_cid_switching", False):
             time.sleep(0.2)
             _cid_prog = st.empty()
             _cid_stat = st.empty()
@@ -897,6 +990,8 @@ with st.sidebar:
             _cid_prog.empty()
             _cid_stat.empty()
             st.rerun()
+    elif _ENV_MODE:
+        st.caption("Using credentials from the process environment")
     else:
         _active = config_store.get_active_profile_name()
         st.caption(f"Profile: {html.escape(_active)}" if _active else "Config loaded")
@@ -1123,7 +1218,7 @@ _PERIOD_OPTIONS = [6, 12, 24, 48, 72, 168]
 
 
 def _on_global_hours_change():
-    if not _is_admin():
+    if not _require_user("admin"):  # callbacks run before the script, with last run's role
         return
     new_hours = st.session_state.get("global_hours", 24)
     # Update cache reporting window — triggers background refresh with new hours
@@ -3102,6 +3197,9 @@ with tab_chat:
 
     @st.fragment
     def _chat_fragment():
+        # Fragment reruns skip the module-level auth gate, so re-check here
+        if not _require_user():
+            st.rerun(scope="app")
         st.subheader("Ask Falcon Digest")
         st.caption("Powered by CrowdStrike Falcon Platform with full MCP tool access")
 
@@ -3174,7 +3272,8 @@ with tab_chat:
                         '<strong>Falcon Digest:</strong> Thinking...</div>',
                         unsafe_allow_html=True
                     )
-                response = call_llm(api_messages, TOOL_DEFINITIONS)
+                deadline = time.monotonic() + TURN_TIME_BUDGET_SECONDS
+                response = call_llm(api_messages, TOOL_DEFINITIONS, deadline=deadline)
                 turn_tool_results = []
 
                 max_iterations = 10
@@ -3196,7 +3295,7 @@ with tab_chat:
                         })
                     api_messages.append({"role": "assistant", "content": response["content"]})
                     api_messages.append({"role": "user", "content": tool_results})
-                    response = call_llm(api_messages, TOOL_DEFINITIONS)
+                    response = call_llm(api_messages, TOOL_DEFINITIONS, deadline=deadline)
 
                 thinking_ph.empty()
 
@@ -3213,7 +3312,11 @@ with tab_chat:
                 _logger.error("LLM error: %s", e, exc_info=True)
                 if thinking_ph:
                     thinking_ph.empty()
-                err_msg = "Sorry, I'm having trouble connecting to Falcon Digest right now. Please try again in a moment."
+                if isinstance(e, LLMTimeoutError):
+                    err_msg = (f"That took longer than {TURN_TIME_BUDGET_SECONDS} seconds, so I stopped. "
+                               "Try a narrower question, or a faster model in Settings.")
+                else:
+                    err_msg = "Sorry, I'm having trouble connecting to Falcon Digest right now. Please try again in a moment."
                 stream_to_chat(chat_container, err_msg)
                 st.session_state.chat_messages.append({
                     "role": "assistant",
