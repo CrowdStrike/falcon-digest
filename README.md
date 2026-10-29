@@ -254,6 +254,16 @@ python -m pytest tests/test_fql_security.py -v
 python -m pytest tests/test_cache.py -v
 ```
 
+## Contributing safely
+
+Local state (`.env*`, `.falcon_*` config/key/users/cache files) is gitignored. To also block commits and pushes that would include those files, common secret formats, or the real Falcon client IDs, secrets, profile names and usernames configured on your machine, enable the bundled hooks once per clone:
+
+```bash
+git config core.hooksPath scripts/git-hooks
+```
+
+Run the same check manually with `python scripts/check_sensitive.py --staged` or `--range origin/main..HEAD`.
+
 ## License
 
 MIT License — see [LICENSE](LICENSE).

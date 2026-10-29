@@ -1,24 +1,18 @@
-# Environment
+# Local state: credentials, encrypted config + key, users, cache, backups.
+# Never commit these (scripts/check_sensitive.py enforces it in git hooks).
 .env
-.env.migrated
+.env.*
+!.env.example
+.falcon_*
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa*
+
 venv/
 __pycache__/
 *.pyc
-
-# Cache files
-.falcon_cache.json
-.falcon_cache.json.tmp
-
-# User credentials (hashed passwords)
-.falcon_users.json
-.falcon_users.json.tmp
-.falcon_users.json.setup
-
-# Encrypted config and key
-.falcon_config.enc
-.falcon_config.enc.tmp
-.falcon_config.key
-.falcon_config.key.tmp
 
 # IDE
 .idea/
@@ -31,8 +25,6 @@ __pycache__/
 # Backups, logs, PID files
 *.bak*
 *.log
-.falcon_cache_daemon.pid
-.falcon_cache_backups/
 
 # Legacy test files (integration, require live API)
 /test_auth.py
@@ -51,7 +43,3 @@ PUBLISH_REQUEST.md
 PUBLISH_REQUEST.txt
 HANDOFF_GUIDE.txt
 mcp_dashboard_v2.py
-
-# Atomic-write temp files and key-creation lock
-.falcon_*.tmp
-.falcon_config.lock
