@@ -36,9 +36,10 @@ from crwd_mcp_server import (
     validate_config, validate_llm_config, ConfigError, clear_client_cache
 )
 from mcp_api_client import call_llm, execute_tool, validate_response, TOOL_DEFINITIONS
-from falcon_cache import cache as falcon_cache, sanitize_error as _sanitize_error
+from crwd_mcp_server import sanitize_error as _sanitize_error
+from falcon_cache import cache as falcon_cache
 from falcon_auth import UserManager, lockout_remaining
-from falcon_secrets import config_store, CLOUD_REGIONS
+from falcon_secrets import config_store, CLOUD_REGIONS, ConfigDecryptError
 
 _logger = logging.getLogger("falcon_mcp.dashboard")
 
@@ -131,12 +132,14 @@ if not st.session_state.authenticated:
         login_pw = st.text_input("Password", type="password", placeholder="Password")
         submitted = st.form_submit_button("Login", type="primary")
         if submitted:
-            result = _user_mgr.authenticate(login_user, login_pw)
+            _ip = getattr(st.context, "ip_address", None)
+            _client = _ip if isinstance(_ip, str) else ""
+            result = _user_mgr.authenticate(login_user, login_pw, client=_client)
             if result:
                 st.session_state.authenticated = True
                 st.session_state.current_user = result
                 st.rerun()
-            _wait = lockout_remaining(login_user)
+            _wait = lockout_remaining(login_user, _client)
             if _wait:
                 st.error(f"Too many failed attempts. Try again in {int(_wait) + 1}s.")
             else:
@@ -222,8 +225,8 @@ def _render_settings_page():
         if st.form_submit_button("Save Profile", type="primary"):
             try:
                 config_store.save_profile(profile_name, client_id, client_secret, CLOUD_REGIONS[cloud_region])
-            except ValueError as e:
-                st.error(str(e))
+            except (ValueError, ConfigDecryptError) as e:
+                st.error(_sanitize_error(e, max_len=400))
             else:
                 _apply_config_change()
                 st.success(f"Profile '{html.escape(profile_name.strip())}' saved.")
@@ -244,10 +247,14 @@ def _render_settings_page():
         llm_model = lcol2.text_input("Model Override", value=llm.get("LLM_MODEL", ""), placeholder="Leave blank for default")
         if st.form_submit_button("Save LLM Settings", type="primary"):
             api_key = "" if clear_key else (llm_key or None)
-            config_store.save_llm_config(llm_endpoint, api_key, llm_provider, llm_model)
-            config_store.inject_to_env()
-            st.success("LLM settings saved.")
-            st.rerun()
+            try:
+                config_store.save_llm_config(llm_endpoint, api_key, llm_provider, llm_model)
+            except ConfigDecryptError as e:
+                st.error(_sanitize_error(e, max_len=400))
+            else:
+                config_store.inject_to_env()
+                st.success("LLM settings saved.")
+                st.rerun()
 
 
 def _render_setup_required(message: str):
@@ -987,8 +994,8 @@ with st.sidebar:
             with st.expander(f"Cache Errors ({len(errs)})"):
                 for e in errs:
                     st.caption(_sanitize_error(e))
-        # Cache restart button
-        if st.button("Refresh Cache Now", key="cache_refresh_btn", width="stretch"):
+        # Cache controls change shared state for every session — admins only
+        if _is_admin() and st.button("Refresh Cache Now", key="cache_refresh_btn", width="stretch"):
             falcon_cache.force_refresh()
             time.sleep(0.2)
             _prog = st.empty()
@@ -1009,7 +1016,7 @@ with st.sidebar:
             '<span class="status-dot status-disconnected"></span> **Data Cache Inactive**',
             unsafe_allow_html=True
         )
-        if st.button("Start Cache", key="cache_start_btn", width="stretch"):
+        if _is_admin() and st.button("Start Cache", key="cache_start_btn", width="stretch"):
             falcon_cache.start(poll_interval=300, ttl=300)
             st.rerun()
 
@@ -1020,10 +1027,12 @@ with st.sidebar:
         refresh_interval = st.slider("Refresh interval (sec)", 30, 300, 60)
         st.caption(f"Refreshing every {refresh_interval}s")
 
-    cache_interval = st.slider("Cache poll interval (sec)", 60, 600, 300, key="cache_poll")
-    if falcon_cache.is_running and falcon_cache.poll_interval != cache_interval:
-        falcon_cache.poll_interval = cache_interval
-        falcon_cache.ttl = cache_interval
+    if _is_admin():
+        cache_interval = st.slider("Cache poll interval (sec)", 60, 600,
+                                   min(max(int(falcon_cache.poll_interval), 60), 600), key="cache_poll")
+        if falcon_cache.is_running and falcon_cache.poll_interval != cache_interval:
+            falcon_cache.poll_interval = cache_interval
+            falcon_cache.ttl = cache_interval
 
     st.divider()
 
@@ -1110,7 +1119,12 @@ st.markdown(f"""
 
 # ============ GLOBAL REPORTING PERIOD ============
 
+_PERIOD_OPTIONS = [6, 12, 24, 48, 72, 168]
+
+
 def _on_global_hours_change():
+    if not _is_admin():
+        return
     new_hours = st.session_state.get("global_hours", 24)
     # Update cache reporting window — triggers background refresh with new hours
     falcon_cache.set_hours(new_hours)
@@ -1133,9 +1147,14 @@ with _period_ts:
             _ago_str = _last_refresh.strftime("%H:%M")
         st.markdown(f'<div style="text-align:right; padding-top:8px; font-size:0.8rem; color:#6B7280;">Updated {_ago_str}</div>', unsafe_allow_html=True)
 with _period_col:
-    st.selectbox("Period", [6, 12, 24, 48, 72, 168], index=5,
+    # The reporting window is shared cache state: admins change it, viewers see the current one
+    if not _is_admin() or "global_hours" not in st.session_state:
+        st.session_state["global_hours"] = falcon_cache.hours if falcon_cache.hours in _PERIOD_OPTIONS else 24
+    st.selectbox("Period", _PERIOD_OPTIONS,
                  format_func=lambda x: f"Last {x}h" if x < 168 else "Last 7d",
                  key="global_hours", on_change=_on_global_hours_change,
+                 disabled=not _is_admin(),
+                 help=None if _is_admin() else "Only admins can change the reporting period.",
                  label_visibility="collapsed")
 
 # ============ SETTINGS PAGE (on-demand) ============

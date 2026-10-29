@@ -111,6 +111,28 @@ def sanitize_fql_value(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9.\-_: @]", "", value)
 
 
+# Filesystem paths: POSIX (2+ segments, not part of a URL) and Windows drive paths
+_POSIX_PATH_RE = re.compile(r"(?<![\w:/.])(?:/[\w.\-]+){2,}/?")
+_WINDOWS_PATH_RE = re.compile(r"\b[A-Za-z]:\\(?:[^\\\s'\"]+\\)*[^\\\s'\"]*")
+
+
+def sanitize_error(msg, max_len: int = 200) -> str:
+    """Strip filesystem paths from an error message and truncate it for display.
+
+    URLs are left intact; only local POSIX/Windows paths are replaced.
+
+    Args:
+        msg: Error message or exception.
+        max_len: Maximum length of the returned string.
+
+    Returns:
+        The sanitized message.
+    """
+    sanitized = _WINDOWS_PATH_RE.sub("[path]", str(msg))
+    sanitized = _POSIX_PATH_RE.sub("[path]", sanitized)
+    return sanitized[:max_len] + "…" if len(sanitized) > max_len else sanitized
+
+
 def _is_crowdstrike_source(name: str) -> bool:
     """Return True if a source_product name belongs to CrowdStrike."""
     lower = (name or "").lower()
@@ -233,7 +255,7 @@ def _run_ngsiem_query(ngsiem_client, query_string: str, start: str = "24h",
         return {"events": [], "error": f"NGSIEM query timed out after {timeout_sec}s"}
 
     except Exception as e:
-        return {"events": [], "error": str(e)}
+        return {"events": [], "error": sanitize_error(e)}
 
 
 # ============ EXISTING TOOL HANDLERS ============
@@ -302,7 +324,7 @@ async def search_alerts(product: str = "cao", severity: str = None, hours: int =
 
     except Exception as e:
         logger.error(f"search_alerts failed: {e}", exc_info=True)
-        return json.dumps({"error": str(e), "tool": "search_alerts", "status": "error"})
+        return json.dumps({"error": sanitize_error(e), "tool": "search_alerts", "status": "error"})
 
 async def search_hosts(platform: str = None, status: str = None, hostname: str = None, last_seen_within: int = None, limit: int = 50) -> str:
     """Search and count CrowdStrike hosts by platform, status, or hostname pattern"""
@@ -367,7 +389,7 @@ async def search_hosts(platform: str = None, status: str = None, hostname: str =
 
     except Exception as e:
         logger.error(f"search_hosts failed: {e}", exc_info=True)
-        return json.dumps({"error": str(e), "tool": "search_hosts", "status": "error"})
+        return json.dumps({"error": sanitize_error(e), "tool": "search_hosts", "status": "error"})
 
 async def get_host_details(hostname: str) -> str:
     """Get detailed information about a specific host"""
@@ -411,7 +433,7 @@ async def get_host_details(hostname: str) -> str:
 
     except Exception as e:
         logger.error(f"get_host_details failed: {e}", exc_info=True)
-        return json.dumps({"error": str(e), "tool": "get_host_details", "status": "error"})
+        return json.dumps({"error": sanitize_error(e), "tool": "get_host_details", "status": "error"})
 
 async def test_fql_filter(filter_string: str) -> str:
     """Test and validate an FQL filter string"""
@@ -448,7 +470,7 @@ async def test_fql_filter(filter_string: str) -> str:
 
     except Exception as e:
         logger.error(f"test_fql_filter failed: {e}", exc_info=True)
-        return json.dumps({"error": str(e), "tool": "test_fql_filter", "status": "error"})
+        return json.dumps({"error": sanitize_error(e), "tool": "test_fql_filter", "status": "error"})
 
 async def list_available_products() -> str:
     """List available product types for filtering alerts"""
@@ -561,7 +583,7 @@ async def search_cases(status: str = None, severity: str = None, hours: int = 72
 
     except Exception as e:
         logger.error(f"search_cases failed: {e}", exc_info=True)
-        return json.dumps({"error": str(e), "tool": "search_cases", "status": "error"})
+        return json.dumps({"error": sanitize_error(e), "tool": "search_cases", "status": "error"})
 
 async def search_detections(severity: str = None, status: str = None, hours: int = 24, limit: int = 50) -> str:
     """Search all detections via Alerts API (EPP, 3rd-party, IDP, CAO)
@@ -673,7 +695,7 @@ async def search_detections(severity: str = None, status: str = None, hours: int
 
     except Exception as e:
         logger.error(f"search_detections failed: {e}", exc_info=True)
-        return json.dumps({"error": str(e), "tool": "search_detections", "status": "error"})
+        return json.dumps({"error": sanitize_error(e), "tool": "search_detections", "status": "error"})
 
 async def search_vulnerabilities(severity: str = None, status: str = None, limit: int = 50) -> str:
     """Search Spotlight vulnerabilities by severity and status"""
@@ -742,7 +764,7 @@ async def search_vulnerabilities(severity: str = None, status: str = None, limit
 
     except Exception as e:
         logger.error(f"search_vulnerabilities failed: {e}", exc_info=True)
-        return json.dumps({"error": str(e), "tool": "search_vulnerabilities", "status": "error"})
+        return json.dumps({"error": sanitize_error(e), "tool": "search_vulnerabilities", "status": "error"})
 
 async def search_threatgraph(indicator_type: str = None, indicator_value: str = None, vertex_type: str = None, vertex_id: str = None, scope: str = "device", limit: int = 50) -> str:
     """Search CrowdStrike ThreatGraph for IOC activity or vertex details.
@@ -840,7 +862,7 @@ async def search_threatgraph(indicator_type: str = None, indicator_value: str = 
 
     except Exception as e:
         logger.error(f"search_threatgraph failed: {e}", exc_info=True)
-        return json.dumps({"error": str(e), "tool": "search_threatgraph", "status": "error"})
+        return json.dumps({"error": sanitize_error(e), "tool": "search_threatgraph", "status": "error"})
 
 async def get_security_posture(hours: int = 24) -> str:
     """Get executive security posture overview across all data sources"""
@@ -926,7 +948,7 @@ async def get_security_posture(hours: int = 24) -> str:
             return ("alerts", result)
         except Exception as e:
             logger.error(f"get_security_posture alerts summary failed: {e}", exc_info=True)
-            return ("alerts", {"total": 0, "by_severity": {}, "by_tactic": {}, "by_time_bucket": {}, "tactic_timeline": [], "error": str(e)})
+            return ("alerts", {"total": 0, "by_severity": {}, "by_tactic": {}, "by_time_bucket": {}, "tactic_timeline": [], "error": sanitize_error(e)})
 
     def _fetch_cases():
         try:
@@ -942,7 +964,7 @@ async def get_security_posture(hours: int = 24) -> str:
             return ("cases", result)
         except Exception as e:
             logger.error(f"get_security_posture cases summary failed: {e}", exc_info=True)
-            return ("cases", {"total": 0, "by_status": {}, "error": str(e)})
+            return ("cases", {"total": 0, "by_status": {}, "error": sanitize_error(e)})
 
     def _fetch_detections():
         try:
@@ -991,7 +1013,7 @@ async def get_security_posture(hours: int = 24) -> str:
             return ("detections", result)
         except Exception as e:
             logger.error(f"get_security_posture detections summary failed: {e}", exc_info=True)
-            return ("detections", {"total": 0, "by_severity": {}, "error": str(e)})
+            return ("detections", {"total": 0, "by_severity": {}, "error": sanitize_error(e)})
 
     def _fetch_vulnerabilities():
         try:
@@ -1007,7 +1029,7 @@ async def get_security_posture(hours: int = 24) -> str:
             return ("vulnerabilities", result)
         except Exception as e:
             logger.error(f"get_security_posture vulnerabilities summary failed: {e}", exc_info=True)
-            return ("vulnerabilities", {"total": 0, "by_severity": {}, "error": str(e)})
+            return ("vulnerabilities", {"total": 0, "by_severity": {}, "error": sanitize_error(e)})
 
     def _fetch_hosts():
         try:
@@ -1032,7 +1054,7 @@ async def get_security_posture(hours: int = 24) -> str:
             return ("hosts", result)
         except Exception as e:
             logger.error(f"get_security_posture hosts summary failed: {e}", exc_info=True)
-            return ("hosts", {"total": 0, "by_platform": {}, "stale_count": 0, "contained_count": 0, "error": str(e)})
+            return ("hosts", {"total": 0, "by_platform": {}, "stale_count": 0, "contained_count": 0, "error": sanitize_error(e)})
 
     def _fetch_subscriptions():
         try:
@@ -1095,7 +1117,7 @@ async def get_security_posture(hours: int = 24) -> str:
             return ("crowdscore", result)
         except Exception as e:
             logger.error(f"get_security_posture crowdscore failed: {e}", exc_info=True)
-            return ("crowdscore", {"current": None, "trend_7d": [], "error": str(e)})
+            return ("crowdscore", {"current": None, "trend_7d": [], "error": sanitize_error(e)})
 
     def _fetch_mttd_mttr():
         try:
@@ -1125,7 +1147,7 @@ async def get_security_posture(hours: int = 24) -> str:
             return ("mttd_mttr", result)
         except Exception as e:
             logger.error(f"get_security_posture mttd/mttr failed: {e}", exc_info=True)
-            return ("mttd_mttr", {"avg_seconds_to_triaged": None, "avg_seconds_to_resolved": None, "sample_size": 0, "error": str(e)})
+            return ("mttd_mttr", {"avg_seconds_to_triaged": None, "avg_seconds_to_resolved": None, "sample_size": 0, "error": sanitize_error(e)})
 
     def _fetch_incidents():
         try:
@@ -1159,7 +1181,7 @@ async def get_security_posture(hours: int = 24) -> str:
             return ("incidents", result)
         except Exception as e:
             logger.error(f"get_security_posture incidents failed: {e}", exc_info=True)
-            return ("incidents", {"total": 0, "by_state": {}, "by_tactic": {}, "error": str(e)})
+            return ("incidents", {"total": 0, "by_state": {}, "by_tactic": {}, "error": sanitize_error(e)})
 
     def _fetch_sensor_health(host_total):
         try:
@@ -1184,7 +1206,7 @@ async def get_security_posture(hours: int = 24) -> str:
             return ("sensor_health", result)
         except Exception as e:
             logger.error(f"get_security_posture sensor health failed: {e}", exc_info=True)
-            return ("sensor_health", {"rfm_count": 0, "total_managed": 0, "coverage_pct": None, "by_version": {}, "error": str(e)})
+            return ("sensor_health", {"rfm_count": 0, "total_managed": 0, "coverage_pct": None, "by_version": {}, "error": sanitize_error(e)})
 
     def _fetch_asset_inventory():
         try:
@@ -1208,7 +1230,7 @@ async def get_security_posture(hours: int = 24) -> str:
             return ("asset_inventory", result)
         except Exception as e:
             logger.error(f"get_security_posture asset inventory failed: {e}", exc_info=True)
-            return ("asset_inventory", {"managed_hosts": 0, "unmanaged_hosts": 0, "iot_assets": 0, "accounts": 0, "applications": 0, "error": str(e)})
+            return ("asset_inventory", {"managed_hosts": 0, "unmanaged_hosts": 0, "iot_assets": 0, "accounts": 0, "applications": 0, "error": sanitize_error(e)})
 
     def _fetch_external_attack_surface():
         try:
@@ -1222,7 +1244,7 @@ async def get_security_posture(hours: int = 24) -> str:
             return ("external_attack_surface", result)
         except Exception as e:
             logger.error(f"get_security_posture external attack surface failed: {e}", exc_info=True)
-            return ("external_attack_surface", {"total_assets": 0, "error": str(e)})
+            return ("external_attack_surface", {"total_assets": 0, "error": sanitize_error(e)})
 
     def _probe_scope(scope_name, dashboard_section, check_fn):
         entry = {"scope": scope_name, "section": dashboard_section, "status": "Unknown"}
@@ -1457,7 +1479,7 @@ async def get_ngsiem_ingestion(hours: int = 24) -> str:
                     source_map[src]["events"] += ev_count
                     source_map[src]["bytes"] += ev_bytes
             except Exception as e:
-                child_entry["error"] = str(e)
+                child_entry["error"] = sanitize_error(e)
             return child_entry
 
         child_results = await asyncio.gather(
@@ -1523,7 +1545,7 @@ async def get_ngsiem_ingestion(hours: int = 24) -> str:
                 source_map[src]["events"] += ev_count
                 source_map[src]["bytes"] += ev_bytes
         except Exception as e:
-            result["error"] = str(e)
+            result["error"] = sanitize_error(e)
 
     # Build sorted top sources
     sorted_sources = sorted(source_map.items(), key=lambda x: x[1]["bytes"], reverse=True)[:10]

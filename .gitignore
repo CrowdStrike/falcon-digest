@@ -51,3 +51,7 @@ PUBLISH_REQUEST.md
 PUBLISH_REQUEST.txt
 HANDOFF_GUIDE.txt
 mcp_dashboard_v2.py
+
+# Atomic-write temp files and key-creation lock
+.falcon_*.tmp
+.falcon_config.lock

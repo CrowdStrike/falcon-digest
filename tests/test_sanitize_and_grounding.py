@@ -134,6 +134,9 @@ class _FakeCache:
     def __init__(self, entries, running=True):
         self._entries = entries
         self.is_running = running
+        self.refresh_count = 1
+        self.last_refresh = None
+        self.entry_count = len(entries)
 
     def get_all(self):
         return {k: dict(v) for k, v in self._entries.items()}
@@ -149,12 +152,28 @@ def grounding(monkeypatch):
             "security_posture": {"data": json.dumps(cached or {}), "fetched_at": "2026-01-01T00:00:00Z"},
         }
         monkeypatch.setattr(mcp_api_client, "falcon_cache", _FakeCache(entries, running))
+        mcp_api_client._known_ids_memo["stamp"] = None  # each case installs new cache contents
         return mcp_api_client.validate_response(text, extra)
 
     return _run
 
 
 class TestGrounding:
+
+    def test_cache_scan_is_memoized_until_refresh(self, monkeypatch):
+        import mcp_api_client
+        fake = _FakeCache({"k": {"data": json.dumps({"ip": "10.9.9.9"}), "fetched_at": ""}})
+        calls = []
+        orig = fake.get_all
+        fake.get_all = lambda: calls.append(1) or orig()
+        monkeypatch.setattr(mcp_api_client, "falcon_cache", fake)
+        mcp_api_client._known_ids_memo["stamp"] = None
+        mcp_api_client.validate_response("seen 10.9.9.9")
+        mcp_api_client.validate_response("seen 10.9.9.9 again")
+        assert len(calls) == 1
+        fake.refresh_count += 1
+        mcp_api_client.validate_response("seen 10.9.9.9")
+        assert len(calls) == 2
 
     def test_known_ip_not_mangled_by_unknown_prefix(self, grounding):
         text = "Hosts 10.0.0.10 and 10.0.0.1 talked."
@@ -192,3 +211,61 @@ class TestGrounding:
     def test_cache_not_running_and_no_tools(self, grounding):
         text = "CVE-2024-9999 on 10.9.9.9"
         assert grounding(text, cached={"cves": ["CVE-2023-0001"]}, running=False) == text
+
+
+# ---------------------------------------------------------------------------
+# Local endpoint detection
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("endpoint,expected", [
+    ("http://localhost:11434", True),
+    ("http://127.0.0.1:11434", True),
+    ("http://0.0.0.0:11434", True),
+    ("http://[::1]:11434", True),
+    ("http://192.168.1.50:11434", True),
+    ("http://ollama.local:11434", True),
+    ("https://api.anthropic.com", False),
+    ("https://localhost-proxy.corp.example", False),
+    ("https://8.8.8.8", False),
+    ("", False),
+])
+def test_is_local_endpoint(endpoint, expected):
+    import mcp_api_client
+    assert mcp_api_client._is_local_endpoint(endpoint) is expected
+
+
+def test_local_model_never_gets_tools_even_without_cache(monkeypatch):
+    import mcp_api_client
+    monkeypatch.setenv("LLM_ENDPOINT", "http://127.0.0.1:11434")
+    monkeypatch.setenv("LLM_PROVIDER", "openai")
+    monkeypatch.setattr(mcp_api_client, "falcon_cache", _FakeCache({}, running=False))
+    sent = {}
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+
+    def _post(url, headers=None, json=None, timeout=None):
+        sent.update(json)
+        return _Resp()
+
+    monkeypatch.setattr(mcp_api_client._session, "post", _post)
+    mcp_api_client.call_llm([{"role": "user", "content": "hi"}], tools=mcp_api_client.TOOL_DEFINITIONS)
+    assert "tools" not in sent
+
+
+def test_tool_error_is_sanitized_at_source(monkeypatch):
+    import mcp_api_client
+
+    def _boom(**kw):
+        raise RuntimeError("failed reading /Users/someone/app/venv/lib/x.py")
+
+    monkeypatch.setattr(mcp_api_client, "search_alerts", _boom)
+    out = mcp_api_client.execute_tool("search_alerts", {})
+    assert "/Users/someone" not in out and "[path]" in out
+
+
+def test_prompts_have_no_concrete_example_counts():
+    src = open(os.path.join(os.path.dirname(__file__), "..", "mcp_api_client.py")).read()
+    assert "201 Linux hosts" not in src

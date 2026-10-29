@@ -18,7 +18,6 @@ MIT License — see LICENSE file for details.
 
 import logging
 import os
-import re
 
 import threading
 import time
@@ -30,6 +29,7 @@ from datetime import datetime, timezone
 logger = logging.getLogger("falcon_mcp.cache")
 
 from crwd_mcp_server import (
+    sanitize_error,
     search_alerts, search_cases, search_detections,
     search_vulnerabilities, search_threatgraph, get_security_posture,
     get_identity_protection, get_cloud_security, get_exposure_management,
@@ -40,28 +40,6 @@ from falcon_secrets import APP_DIR, encrypt_cache, decrypt_cache, refresh_env_fr
 
 CACHE_FILE = os.path.join(APP_DIR, ".falcon_cache.json")
 CACHE_BACKUP_DIR = os.path.join(APP_DIR, ".falcon_cache_backups")
-
-# Filesystem paths: POSIX (2+ segments, not part of a URL) and Windows drive paths
-_POSIX_PATH_RE = re.compile(r"(?<![\w:/.])(?:/[\w.\-]+){2,}/?")
-_WINDOWS_PATH_RE = re.compile(r"\b[A-Za-z]:\\(?:[^\\\s'\"]+\\)*[^\\\s'\"]*")
-
-
-def sanitize_error(msg, max_len: int = 200) -> str:
-    """Strip filesystem paths from an error message and truncate it for display.
-
-    URLs are left intact; only local POSIX/Windows paths are replaced.
-
-    Args:
-        msg: Error message or exception.
-        max_len: Maximum length of the returned string.
-
-    Returns:
-        The sanitized message.
-    """
-    sanitized = _WINDOWS_PATH_RE.sub("[path]", str(msg))
-    sanitized = _POSIX_PATH_RE.sub("[path]", sanitized)
-    return sanitized[:max_len] + "…" if len(sanitized) > max_len else sanitized
-
 
 def _get_cid_fingerprint() -> str:
     """Return a short fingerprint of current credentials for change detection."""
@@ -93,7 +71,7 @@ class FalconCache:
         self._polling_thread = None
         self._running = False
         self.poll_interval = 300   # seconds between refreshes
-        self.ttl = 86400           # seconds before entry is stale; callers normally override via start()
+        self.ttl = 300             # seconds before entry is stale
         self._last_refresh = None
         self._refresh_count = 0
         self._errors = []
@@ -110,7 +88,7 @@ class FalconCache:
 
     # ---------- lifecycle ----------
 
-    def start(self, poll_interval: int = 300, ttl: int = 86400):
+    def start(self, poll_interval: int = 300, ttl: int = 300):
         """Start background polling. Safe to call multiple times."""
         # If thread died but _running is still True, reset it
         if self._running and self._polling_thread and not self._polling_thread.is_alive():
@@ -153,6 +131,11 @@ class FalconCache:
         logger.info("Reporting window changed: %dh → %dh — refreshing cache", self._hours, hours)
         self._hours = hours
         self.force_refresh()
+
+    @property
+    def hours(self) -> int:
+        """Current reporting window in hours (shared by every dashboard session)."""
+        return self._hours
 
     @property
     def is_running(self) -> bool:
@@ -582,39 +565,29 @@ class FalconCache:
 
         # Top Affected Hosts (cross-referenced from all data sources)
         host_issues: dict[str, dict] = {}
-        for sev_key in ["alerts_critical", "alerts_high"]:
-            sdata = self.get_parsed(sev_key)
-            if sdata and isinstance(sdata, dict):
-                for a in sdata.get("alerts", []):
-                    h = a.get("hostname") or "N/A"
-                    if h == "N/A":
-                        continue
-                    host_issues.setdefault(h, {"alerts": 0, "vulns": 0, "detections": 0, "platform": ""})
-                    host_issues[h]["alerts"] += 1
-        ddata = self.get_parsed("detections_recent")
-        if ddata and isinstance(ddata, dict):
-            for d in ddata.get("detections", []):
-                h = d.get("hostname") or "N/A"
-                if h == "N/A":
+
+        def _tally(cache_key: str, list_field: str, counter: str):
+            data = self.get_parsed(cache_key)
+            items = data.get(list_field, []) if isinstance(data, dict) else []
+            for item in items:
+                h = item.get("hostname")
+                if not h or h == "N/A":
                     continue
-                host_issues.setdefault(h, {"alerts": 0, "vulns": 0, "detections": 0, "platform": ""})
-                host_issues[h]["detections"] += 1
-        vdata = self.get_parsed("vulnerabilities_critical")
-        if vdata and isinstance(vdata, dict):
-            for v in vdata.get("vulnerabilities", []):
-                h = v.get("hostname") or "N/A"
-                if h == "N/A":
-                    continue
-                host_issues.setdefault(h, {"alerts": 0, "vulns": 0, "detections": 0, "platform": ""})
-                host_issues[h]["vulns"] += 1
-                if v.get("os_version") and not host_issues[h]["platform"]:
-                    os_v = v["os_version"].lower()
+                entry = host_issues.setdefault(h, {"alerts": 0, "vulns": 0, "detections": 0, "platform": ""})
+                entry[counter] += 1
+                os_v = (item.get("os_version") or "").lower()
+                if os_v and not entry["platform"]:
                     if "windows" in os_v:
-                        host_issues[h]["platform"] = "Windows"
-                    elif "linux" in os_v or "ubuntu" in os_v or "centos" in os_v or "rhel" in os_v:
-                        host_issues[h]["platform"] = "Linux"
+                        entry["platform"] = "Windows"
+                    elif any(k in os_v for k in ("linux", "ubuntu", "centos", "rhel")):
+                        entry["platform"] = "Linux"
                     elif "mac" in os_v or "darwin" in os_v:
-                        host_issues[h]["platform"] = "Mac"
+                        entry["platform"] = "Mac"
+
+        _tally("alerts_critical", "alerts", "alerts")
+        _tally("alerts_high", "alerts", "alerts")
+        _tally("detections_recent", "detections", "detections")
+        _tally("vulnerabilities_critical", "vulnerabilities", "vulns")
         if host_issues:
             ranked = sorted(host_issues.items(), key=lambda x: sum([x[1]["alerts"], x[1]["vulns"], x[1]["detections"]]), reverse=True)
             lines.append(f"## Top Affected Hosts ({len(ranked)} hosts with issues)")

@@ -33,10 +33,12 @@ USERS_FILE = os.path.join(APP_DIR, ".falcon_users.json")
 ROLES = ("admin", "viewer")
 _PBKDF2_ITERATIONS = 600_000
 
-# Failed-login throttling (process-wide, keyed by normalized username)
+# Failed-login throttling (process-wide), keyed by client + normalized username,
+# so a remote attacker can't lock a user out from everyone else's address
 _MAX_FREE_ATTEMPTS = 5
 _LOCKOUT_BASE_SECONDS = 30
-_LOCKOUT_MAX_SECONDS = 900
+_LOCKOUT_MAX_SECONDS = 300
+_MAX_TRACKED = 10_000
 _failed_logins: dict[str, tuple[int, float]] = {}
 _failed_lock = threading.Lock()
 
@@ -67,25 +69,47 @@ def _verify_password(password: str, stored_hash: str, salt_hex: str) -> bool:
     return hmac.compare_digest(dk.hex(), stored_hash)
 
 
-def lockout_remaining(username: str) -> float:
-    """Return seconds until ``username`` may attempt to log in again (0 if not locked)."""
-    with _failed_lock:
-        count, last = _failed_logins.get(normalize_username(username), (0, 0.0))
+def _throttle_key(username: str, client: str) -> str:
+    return f"{client or '-'}|{normalize_username(username)}"
+
+
+def _lockout_for(count: int, last: float, now: float) -> float:
     if count < _MAX_FREE_ATTEMPTS:
         return 0.0
     delay = min(_LOCKOUT_BASE_SECONDS * 2 ** (count - _MAX_FREE_ATTEMPTS), _LOCKOUT_MAX_SECONDS)
-    return max(0.0, last + delay - time.time())
+    return max(0.0, last + delay - now)
 
 
-def _record_failure(username: str) -> None:
+def lockout_remaining(username: str, client: str = "") -> float:
+    """Return seconds until ``username`` may log in again from ``client`` (0 if not locked).
+
+    Args:
+        username: Username being attempted (normalized internally).
+        client: Identifier of the requesting client, e.g. its IP address.
+    """
     with _failed_lock:
-        count, _ = _failed_logins.get(username, (0, 0.0))
-        _failed_logins[username] = (count + 1, time.time())
+        count, last = _failed_logins.get(_throttle_key(username, client), (0, 0.0))
+    return _lockout_for(count, last, time.time())
 
 
-def _clear_failures(username: str) -> None:
+def _record_failure(key: str) -> None:
+    now = time.time()
     with _failed_lock:
-        _failed_logins.pop(username, None)
+        count, last = _failed_logins.get(key, (0, 0.0))
+        if now - last > _LOCKOUT_MAX_SECONDS * 2:
+            count = 0  # old failures are forgotten
+        _failed_logins[key] = (count + 1, now)
+        if len(_failed_logins) > _MAX_TRACKED:
+            stale = [k for k, (_, t) in _failed_logins.items() if now - t > _LOCKOUT_MAX_SECONDS * 2]
+            for k in stale:
+                del _failed_logins[k]
+            while len(_failed_logins) > _MAX_TRACKED:  # still full: drop the oldest
+                del _failed_logins[min(_failed_logins, key=lambda k: _failed_logins[k][1])]
+
+
+def _clear_failures(key: str) -> None:
+    with _failed_lock:
+        _failed_logins.pop(key, None)
 
 
 class UserManager:
@@ -143,18 +167,25 @@ class UserManager:
             return None
         return {"username": username, "role": user.get("role", "viewer")}
 
-    def authenticate(self, username: str, password: str) -> dict | None:
+    def authenticate(self, username: str, password: str, client: str = "") -> dict | None:
         """Verify credentials.
 
         Unknown usernames are checked against a dummy hash so response time
-        doesn't reveal which usernames exist. Repeated failures lock the
-        username out with exponential backoff (see ``lockout_remaining``).
+        doesn't reveal which usernames exist. Repeated failures from the same
+        client lock that client out for that username with exponential
+        backoff (see ``lockout_remaining``); other clients are unaffected.
+
+        Args:
+            username: Username (case-insensitive).
+            password: Password.
+            client: Identifier of the requesting client, e.g. its IP address.
 
         Returns:
             ``{"username", "role"}`` on success, else None.
         """
         username = normalize_username(username)
-        if lockout_remaining(username) > 0:
+        throttle_key = _throttle_key(username, client)
+        if lockout_remaining(username, client) > 0:
             return None
         user = self._users.get(username)
         if user:
@@ -163,9 +194,9 @@ class UserManager:
             _verify_password(password or "", _DUMMY_HASH, _DUMMY_SALT.hex())
             ok = False
         if not ok:
-            _record_failure(username)
+            _record_failure(throttle_key)
             return None
-        _clear_failures(username)
+        _clear_failures(throttle_key)
         return {"username": username, "role": user.get("role", "viewer")}
 
     def add_user(self, username: str, password: str, role: str = "viewer") -> str | None:

@@ -16,8 +16,10 @@ Copyright 2024 CrowdStrike, Inc.
 MIT License — see LICENSE file for details.
 """
 
+import ipaddress
 import requests
 import os
+from urllib.parse import urlparse
 import json
 import asyncio
 import logging
@@ -28,7 +30,7 @@ from crwd_mcp_server import (
     search_alerts, get_host_details, test_fql_filter, list_available_products,
     search_cases, search_detections, search_vulnerabilities,
     search_threatgraph, get_security_posture, search_hosts,
-    validate_config, validate_llm_config, ConfigError
+    validate_config, validate_llm_config, ConfigError, sanitize_error
 )
 from falcon_cache import cache as falcon_cache
 
@@ -196,6 +198,26 @@ TOOL_DEFINITIONS = [
         }
     }
 ]
+
+
+def _is_local_endpoint(endpoint: str) -> bool:
+    """Return True if the LLM endpoint is a self-hosted model on this machine or private network.
+
+    Local/small models get a simplified prompt and no tool definitions.
+
+    Args:
+        endpoint: LLM endpoint URL.
+    """
+    host = (urlparse(endpoint if "://" in endpoint else f"http://{endpoint}").hostname or "").lower()
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_unspecified or ip.is_link_local
 
 
 def _default_model() -> str:
@@ -375,7 +397,9 @@ def call_llm(messages, tools=None, system_context=None) -> dict:
 
     # Prepend cached context as a message pair so the AI has data upfront.
     # We avoid using the "system" payload field since some endpoints may not support it.
-    _is_local = "localhost" in endpoint or "127.0.0.1" in endpoint
+    _is_local = _is_local_endpoint(endpoint)
+    if _is_local:
+        tools = None  # Small local models handle tool definitions poorly; answer from cache only
 
     if system_context:
         if _is_local:
@@ -391,19 +415,18 @@ RULES (follow strictly):
 3. If the cached data does not have what was asked, say what IS available and what is missing.
 4. Never fabricate hostnames, IPs, CVEs, or numbers not in the data above.
 5. Never describe JSON structure. Interpret the data and present findings like a security analyst.
-6. For counts: lead with the bold number, e.g. "**201 Linux hosts** under management."
+6. For counts: lead with the bold number, e.g. "**<N> Linux hosts** under management." where <N> is the exact number from the data.
 7. For briefings: start with "Risk Score: **X/100** (Level)" then use a summary table.
 8. Use markdown tables for any list with 3+ items.
 9. End briefings with 2-3 actionable recommendations.
 10. Only answer CrowdStrike Falcon security questions."""
-            tools = None  # Don't offer tools to local models
         else:
             # Full prompt for cloud LLMs (Anthropic, OpenAI) — detailed formatting, grounding, security
             prompt_text = f"""[Security Data Context]
 {system_context}
 
 IMPORTANT: Answer ALL questions using ONLY the cached data above. {cache_age_note} If data seems stale, mention the cache age in your answer. Do NOT call tools unless the user explicitly asks for live/fresh data.
-If the cached data does not contain enough detail to fully answer a question, answer with what IS available and be specific about what's missing (e.g., "The cache has 201 Linux hosts but no per-host alert breakdown. Here's what I can tell you from the data I have: ..."). Never give a vague non-answer.
+If the cached data does not contain enough detail to fully answer a question, answer with what IS available and be specific about what's missing (e.g., "The cache has <N> Linux hosts but no per-host alert breakdown. Here's what I can tell you from the data I have: ..."). Never give a vague non-answer.
 
 # Identity & Boundaries
 
@@ -548,6 +571,25 @@ def _scan_identifiers(text: str, known: dict) -> None:
     known["ips"].update(_IP_RE.findall(text))
 
 
+_known_ids_memo: dict = {"stamp": None, "ids": {"cves": set(), "ips": set()}}
+
+
+def _cached_identifiers() -> dict:
+    """Return CVEs/IPs found in the cache, rescanning only after the cache changes.
+
+    Returns:
+        Dict with ``cves`` and ``ips`` sets (shared; callers must copy before mutating).
+    """
+    stamp = (falcon_cache.refresh_count, falcon_cache.last_refresh, falcon_cache.entry_count)
+    if _known_ids_memo["stamp"] != stamp:
+        ids = {"cves": set(), "ips": set()}
+        for entry in falcon_cache.get_all().values():
+            data = entry.get("data") if isinstance(entry, dict) else None
+            _scan_identifiers(data if isinstance(data, str) else json.dumps(data, default=str), ids)
+        _known_ids_memo.update(stamp=stamp, ids=ids)
+    return _known_ids_memo["ids"]
+
+
 def _extract_known_identifiers(extra_context: list[str] | None = None) -> dict:
     """Collect identifiers that are backed by Falcon data.
 
@@ -560,11 +602,8 @@ def _extract_known_identifiers(extra_context: list[str] | None = None) -> dict:
     Returns:
         Dict with ``cves`` and ``ips`` sets.
     """
-    known = {"cves": set(), "ips": set()}
-    if falcon_cache.is_running:
-        for entry in falcon_cache.get_all().values():
-            data = entry.get("data") if isinstance(entry, dict) else None
-            _scan_identifiers(data if isinstance(data, str) else json.dumps(data, default=str), known)
+    cached = _cached_identifiers() if falcon_cache.is_running else {"cves": set(), "ips": set()}
+    known = {"cves": set(cached["cves"]), "ips": set(cached["ips"])}
     for chunk in extra_context or []:
         _scan_identifiers(chunk if isinstance(chunk, str) else json.dumps(chunk, default=str), known)
     return known
@@ -675,7 +714,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
     except Exception as e:
         logger.error("Error executing tool %s: %s", tool_name, str(e), exc_info=True)
-        return f"Error executing {tool_name}: {str(e)}"
+        return f"Error executing {tool_name}: {sanitize_error(e)}"
 
 
 TOOL_LABELS = {

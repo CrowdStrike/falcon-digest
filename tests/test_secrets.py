@@ -37,6 +37,10 @@ def isolated_key(tmp_path, monkeypatch):
     monkeypatch.setattr(falcon_secrets, "_keyring_available", False)
     monkeypatch.setattr(falcon_secrets, "_KEY_FILE", str(tmp_path / ".falcon_config.key"))
     monkeypatch.setattr(falcon_secrets, "CONFIG_FILE", str(tmp_path / ".falcon_config.enc"))
+    monkeypatch.setattr(falcon_secrets, "_KEY_LOCK_FILE", str(tmp_path / ".falcon_config.lock"))
+    falcon_secrets._reset_key_cache()
+    yield
+    falcon_secrets._reset_key_cache()
 
 
 @pytest.fixture
@@ -152,6 +156,7 @@ class TestDecryptFailure:
 
         other_key = os.urandom(32)
         monkeypatch.setattr(falcon_secrets, "_get_or_create_key", lambda: other_key)
+        falcon_secrets._reset_key_cache()  # the Fernet instance is cached per process
         store2 = ConfigStore(path=cfg_path)
         assert store2.load_error
         assert store2.has_config() is False
@@ -243,13 +248,34 @@ class TestFileHelpers:
 
     def test_write_private_file_mode_and_cleanup(self, tmp_path):
         target = tmp_path / "secret.bin"
-        tmp = tmp_path / "secret.bin.tmp"
-        tmp.write_bytes(b"old")
-        os.chmod(tmp, 0o644)
+        target.write_bytes(b"old")
+        os.chmod(target, 0o644)
         write_private_file(str(target), b"new-data")
         assert target.read_bytes() == b"new-data"
         assert _mode(target) == 0o600
-        assert not tmp.exists()
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["secret.bin"]  # no temp files left
+
+    def test_write_private_file_concurrent_writers(self, tmp_path):
+        import threading
+        target = str(tmp_path / "cache.bin")
+        payloads = [bytes([i]) * 200_000 for i in range(8)]
+        errors = []
+
+        def _writer(data):
+            try:
+                for _ in range(20):
+                    write_private_file(target, data)
+            except Exception as e:  # pragma: no cover - failure path
+                errors.append(e)
+
+        threads = [threading.Thread(target=_writer, args=(p,)) for p in payloads]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors
+        assert open(target, "rb").read() in payloads  # never a mix or truncated file
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["cache.bin"]
 
     def test_cache_encryption_round_trip(self):
         payload = {"entries": {"k": {"data": "{}"}}, "_meta": {"cid_fingerprint": "abc"}}
@@ -260,3 +286,114 @@ class TestFileHelpers:
     def test_decrypt_garbage_returns_none(self):
         assert decrypt_cache(b"definitely not fernet") is None
         assert decrypt_cache(b'{"plain": "json"}') is None
+
+
+# ---------------------------------------------------------------------------
+# Multi-profile legacy migration, key store failures, concurrent key creation
+# ---------------------------------------------------------------------------
+
+LEGACY_MULTI = """# Hosted LLM (previous)
+#LLM_API_KEY=old-cloud-key
+#LLM_ENDPOINT=https://llm.example.com
+#LLM_PROVIDER=anthropic
+
+# Self-hosted LLM
+LLM_API_KEY=not-needed
+LLM_ENDPOINT=http://localhost:11434
+LLM_PROVIDER=openai
+LLM_MODEL=qwen2.5:7b-instruct
+
+#lab-test
+#FALCON_CLIENT_ID=id-lab
+#FALCON_CLIENT_SECRET=secret-lab
+#FALCON_BASE_URL=https://api.crowdstrike.com
+
+#prod-us2
+FALCON_CLIENT_ID=id-prod
+FALCON_CLIENT_SECRET="secret-prod"
+FALCON_BASE_URL=https://api.us-2.crowdstrike.com
+
+#msp: someone@example.com
+#FALCON_CLIENT_ID=id-msp
+#FALCON_CLIENT_SECRET=secret-msp
+#FALCON_BASE_URL=https://api.crowdstrike.com
+"""
+
+
+class TestLegacyMultiProfile:
+
+    def test_parse_all_profiles_and_active(self):
+        profiles, active = falcon_secrets.parse_legacy_env_profiles(LEGACY_MULTI)
+        assert list(profiles) == ["lab-test", "prod-us2", "msp: someone@example.com"]
+        assert active == "prod-us2"
+        assert profiles["prod-us2"]["FALCON_CLIENT_SECRET"] == "secret-prod"  # quotes stripped
+        assert profiles["prod-us2"]["FALCON_BASE_URL"] == "https://api.us-2.crowdstrike.com"
+        assert profiles["lab-test"]["FALCON_CLIENT_SECRET"] == "secret-lab"
+
+    def test_llm_blocks_are_not_profiles(self):
+        profiles, _ = falcon_secrets.parse_legacy_env_profiles(LEGACY_MULTI)
+        assert not any("LLM" in n for n in profiles)
+
+    def test_headerless_active_block_is_default(self):
+        profiles, active = falcon_secrets.parse_legacy_env_profiles(
+            "FALCON_CLIENT_ID=a\nFALCON_CLIENT_SECRET=b\n")
+        assert active == "default" and profiles["default"]["FALCON_CLIENT_ID"] == "a"
+
+    def test_incomplete_profile_skipped(self):
+        profiles, _ = falcon_secrets.parse_legacy_env_profiles("#x\n#FALCON_CLIENT_ID=only-id\n")
+        assert profiles == {}
+
+    def test_migrate_imports_every_profile(self, tmp_path, cfg_path):
+        env = tmp_path / ".env"
+        env.write_text(LEGACY_MULTI)
+        store = ConfigStore(path=cfg_path)
+        assert store.migrate_from_env(str(env)) is True
+        names = {p["name"]: p["active"] for p in ConfigStore(path=cfg_path).list_profiles()}
+        assert names == {"lab-test": False, "prod-us2": True, "msp: someone@example.com": False}
+        llm = ConfigStore(path=cfg_path).get_llm_config(include_secret=True)
+        assert llm["LLM_ENDPOINT"] == "http://localhost:11434" and llm["LLM_PROVIDER"] == "openai"
+        assert (tmp_path / ".env.migrated").exists() and not env.exists()
+
+
+class _BrokenKeyring:
+    def get_password(self, *a):
+        raise RuntimeError("keychain locked")
+
+    def set_password(self, *a):  # pragma: no cover - must not be reached
+        raise AssertionError("must not create a key when the keychain can't be read")
+
+
+class TestKeyStore:
+
+    def test_keychain_read_error_does_not_create_key(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(falcon_secrets, "_keyring_available", True)
+        monkeypatch.setattr(falcon_secrets, "_keyring", _BrokenKeyring())
+        with pytest.raises(falcon_secrets.KeyUnavailableError):
+            falcon_secrets._get_or_create_key()
+        assert not (tmp_path / ".falcon_config.key").exists()
+        assert falcon_secrets.encrypt_cache({"a": 1}) is None  # cache persistence is skipped
+
+    def test_concurrent_first_run_gets_one_key(self, tmp_path):
+        import threading
+        keys, barrier = [], threading.Barrier(8)
+
+        def _get():
+            barrier.wait()
+            keys.append(falcon_secrets._get_or_create_key())
+
+        threads = [threading.Thread(target=_get) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(set(keys)) == 1
+        assert open(tmp_path / ".falcon_config.key", "rb").read() == keys[0]
+
+    def test_fernet_is_cached(self, monkeypatch):
+        calls = []
+        real = falcon_secrets._get_or_create_key
+        monkeypatch.setattr(falcon_secrets, "_get_or_create_key", lambda: calls.append(1) or real())
+        blob = falcon_secrets.encrypt_cache({"a": 1})
+        assert falcon_secrets.decrypt_cache(blob) == {"a": 1}
+        falcon_secrets.encrypt_cache({"b": 2})
+        assert len(calls) == 1

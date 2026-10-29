@@ -171,3 +171,33 @@ class TestSetupToken:
         mgr.consume_setup_token()
         assert not os.path.exists(mgr.setup_token_path)
         assert mgr.verify_setup_token(token) is False
+
+
+@pytest.fixture
+def um(users_path):
+    return UserManager(path=users_path)
+
+
+class TestPerClientLockout:
+
+    def test_lockout_is_per_client(self, um):
+        um.add_user("admin", "correct-password", role="admin")
+        for _ in range(6):
+            assert um.authenticate("admin", "wrong", client="203.0.113.9") is None
+        assert falcon_auth.lockout_remaining("admin", "203.0.113.9") > 0
+        # the real admin on another address is not locked out
+        assert falcon_auth.lockout_remaining("admin", "127.0.0.1") == 0
+        assert um.authenticate("admin", "correct-password", client="127.0.0.1")
+
+    def test_lockout_capped(self, um, monkeypatch):
+        now = [1_000_000.0]
+        monkeypatch.setattr(falcon_auth.time, "time", lambda: now[0])
+        for _ in range(40):
+            um.authenticate("ghost", "x", client="c")
+        assert falcon_auth.lockout_remaining("ghost", "c") <= falcon_auth._LOCKOUT_MAX_SECONDS
+
+    def test_tracking_is_bounded(self, um, monkeypatch):
+        monkeypatch.setattr(falcon_auth, "_MAX_TRACKED", 50)
+        for i in range(200):
+            falcon_auth._record_failure(f"c|user{i}")
+        assert len(falcon_auth._failed_logins) <= 50
