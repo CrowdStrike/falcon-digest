@@ -206,6 +206,7 @@ def test_settings_activate_is_not_reverted_by_sidebar():
     at = at.run()
     at = at.run()
     assert config_store.get_active_profile_name() == "p2"
+    assert next(s for s in at.selectbox if s.label == "CID Profile").value == "p2"  # sidebar shows it too
 
 
 def test_sidebar_selector_switches_profile():
@@ -224,6 +225,7 @@ def test_external_switch_is_not_reverted():
     at = at.run()
     at = at.run()
     assert config_store.get_active_profile_name() == "p2"
+    assert next(s for s in at.selectbox if s.label == "CID Profile").value == "p2"
 
 
 # ---------------------------------------------------------------------------
