@@ -29,16 +29,18 @@ from datetime import datetime, timezone
 logger = logging.getLogger("falcon_mcp.cache")
 
 from crwd_mcp_server import (
+    sanitize_error,
     search_alerts, search_cases, search_detections,
     search_vulnerabilities, search_threatgraph, get_security_posture,
     get_identity_protection, get_cloud_security, get_exposure_management,
     get_ngsiem_ingestion
 )
+from falcon_secrets import APP_DIR, encrypt_cache, decrypt_cache, refresh_env_from_store, write_private_file
 
 
-CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".falcon_cache.json")
-CACHE_BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".falcon_cache_backups")
-
+CACHE_FILE = os.path.join(APP_DIR, ".falcon_cache.json")
+CACHE_BACKUP_DIR = os.path.join(APP_DIR, ".falcon_cache_backups")
+MAX_CACHE_BACKUPS = 5
 
 def _get_cid_fingerprint() -> str:
     """Return a short fingerprint of current credentials for change detection."""
@@ -69,8 +71,8 @@ class FalconCache:
         self._lock = threading.Lock()
         self._polling_thread = None
         self._running = False
-        self.poll_interval = 300  # seconds between refreshes
-        self.ttl = 300            # seconds before entry is stale
+        self.poll_interval = 300   # seconds between refreshes
+        self.ttl = 300             # seconds before entry is stale
         self._last_refresh = None
         self._refresh_count = 0
         self._errors = []
@@ -83,6 +85,7 @@ class FalconCache:
         self._refresh_done = 0      # how many sources completed
         self._refresh_total = 0     # how many sources total
         self._refresh_current = {}  # {key: "pending"|"loading"|"done"|"error"}
+        self._secure_backup_dir()
         self._load_from_file()
 
     # ---------- lifecycle ----------
@@ -130,6 +133,11 @@ class FalconCache:
         logger.info("Reporting window changed: %dh → %dh — refreshing cache", self._hours, hours)
         self._hours = hours
         self.force_refresh()
+
+    @property
+    def hours(self) -> int:
+        """Current reporting window in hours (shared by every dashboard session)."""
+        return self._hours
 
     @property
     def is_running(self) -> bool:
@@ -183,9 +191,9 @@ class FalconCache:
         while self._running:
             time.sleep(self.poll_interval)
             if self._running:
-                # Check for CID change before each refresh
-                from dotenv import load_dotenv
-                load_dotenv(override=True)
+                # Pick up config changes (e.g. a profile switch saved by another
+                # process), then check for a CID change before refreshing
+                refresh_env_from_store()
                 self.check_cid_change()
                 self._refresh_all()
 
@@ -252,12 +260,12 @@ class FalconCache:
                 for future in as_completed(futures):
                     key, result = future.result()
                     if isinstance(result, Exception):
-                        self._errors.append(f"{key}: {result}")
+                        self._errors.append(f"{key}: {sanitize_error(result)}")
                         logger.error(f"Error fetching {key}: {result}")
                         self._refresh_current[key] = "error"
                         with self._lock:
                             self._cache[key] = {
-                                "data": json.dumps({"error": str(result)}),
+                                "data": json.dumps({"error": sanitize_error(result)}),
                                 "fetched_at": now_ts,
                             }
                     else:
@@ -282,28 +290,47 @@ class FalconCache:
     # ---------- file persistence ----------
 
     def _save_to_file(self):
-        """Atomically write cache dict to JSON file with CID fingerprint."""
+        """Atomically write encrypted cache to file with CID fingerprint."""
         try:
             with self._lock:
                 snapshot = {k: dict(v) for k, v in self._cache.items()}
-            # Wrap with metadata so we can detect CID changes
             payload = {
                 "_meta": {"cid_fingerprint": self._cid_fingerprint},
                 "entries": snapshot,
             }
-            tmp_path = CACHE_FILE + ".tmp"
-            with open(tmp_path, "w") as f:
-                json.dump(payload, f)
-            os.replace(tmp_path, CACHE_FILE)
+            encrypted = encrypt_cache(payload)
+            if encrypted is None:
+                # Never fall back to plaintext on disk
+                logger.error("Cache encryption failed — skipping cache persistence")
+                return
+            write_private_file(CACHE_FILE, encrypted)
             logger.debug(f"Cache saved to {CACHE_FILE} ({len(snapshot)} entries)")
         except Exception as e:
             logger.error(f"Failed to save cache file: {e}")
 
     def _load_from_file(self) -> bool:
-        """Load cache from JSON file. Clears and backs up if CID changed."""
+        """Load cache from file. Tries encrypted first, falls back to legacy plaintext."""
         try:
-            with open(CACHE_FILE, "r") as f:
-                data = json.load(f)
+            with open(CACHE_FILE, "rb") as f:
+                raw = f.read()
+
+            data = None
+            was_plaintext = False
+
+            # Try encrypted format first
+            decrypted = decrypt_cache(raw)
+            if decrypted is not None:
+                data = decrypted
+                logger.debug("Cache loaded from encrypted file")
+            else:
+                # Fall back to legacy plaintext JSON
+                try:
+                    data = json.loads(raw)
+                    was_plaintext = True
+                    logger.debug("Cache loaded from plaintext file (legacy)")
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    logger.warning("Cache file is neither valid encrypted nor valid JSON — ignoring")
+                    return False
 
             # Handle new format with _meta
             if isinstance(data, dict) and "_meta" in data:
@@ -321,28 +348,103 @@ class FalconCache:
                     self._cache = data
                 self._loaded_from_file = True
                 logger.info(f"Cache loaded from {CACHE_FILE} ({len(data)} entries)")
+                if was_plaintext:
+                    # Upgrade path: don't leave tenant data on disk in plaintext
+                    self._save_to_file()
+                    if decrypt_cache(open(CACHE_FILE, "rb").read()) is None:
+                        logger.warning("Legacy plaintext cache could not be re-encrypted; it is still on disk")
+                    else:
+                        logger.info("Legacy plaintext cache re-encrypted")
                 return True
         except FileNotFoundError:
             logger.debug(f"No cache file found at {CACHE_FILE}")
-        except (json.JSONDecodeError, OSError) as e:
+        except OSError as e:
             logger.warning(f"Failed to load cache file: {e}")
         return False
 
-    def _backup_and_clear_file(self):
-        """Move stale cache file to backup directory."""
+    @staticmethod
+    def _encrypted_backup_bytes(raw: bytes) -> bytes | None:
+        """Return ``raw`` as ciphertext suitable for a backup, or None if it can't be stored safely."""
+        if decrypt_cache(raw) is not None:
+            return raw  # already encrypted with the current key
         try:
-            os.makedirs(CACHE_BACKUP_DIR, exist_ok=True)
-            ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
-            backup_path = os.path.join(CACHE_BACKUP_DIR, f"cache_{ts}.json")
-            os.replace(CACHE_FILE, backup_path)
-            logger.info(f"Old cache backed up to {backup_path}")
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None  # unreadable (e.g. encrypted with an old key) — not worth keeping
+        return encrypt_cache(payload)
+
+    @staticmethod
+    def _prune_backups(keep: int = MAX_CACHE_BACKUPS) -> None:
+        """Delete all but the newest ``keep`` cache backups."""
+        try:
+            files = [os.path.join(CACHE_BACKUP_DIR, n) for n in os.listdir(CACHE_BACKUP_DIR)]
+        except OSError:
+            return
+        files = sorted((f for f in files if os.path.isfile(f)), key=os.path.getmtime, reverse=True)
+        for old in files[keep:]:
+            try:
+                os.remove(old)
+            except OSError as e:
+                logger.warning(f"Failed to prune cache backup: {e}")
+
+    @staticmethod
+    def _secure_backup_dir() -> None:
+        """Encrypt or delete legacy plaintext cache backups and prune old ones (best effort)."""
+        if not os.path.isdir(CACHE_BACKUP_DIR):
+            return
+        try:
+            os.chmod(CACHE_BACKUP_DIR, 0o700)
+            for name in os.listdir(CACHE_BACKUP_DIR):
+                path = os.path.join(CACHE_BACKUP_DIR, name)
+                if not os.path.isfile(path):
+                    continue
+                with open(path, "rb") as f:
+                    raw = f.read()
+                if decrypt_cache(raw) is not None:
+                    continue
+                encrypted = FalconCache._encrypted_backup_bytes(raw)
+                if encrypted is not None:
+                    base = path[:-5] if path.endswith(".json") else path
+                    write_private_file(base + ".enc", encrypted)
+                    if base + ".enc" != path:
+                        os.remove(path)
+                    logger.info(f"Encrypted legacy cache backup {name}")
+                else:
+                    os.remove(path)
+                    logger.info(f"Deleted cache backup {name} that could not be stored encrypted")
+        except Exception as e:
+            logger.warning(f"Failed to secure cache backups: {e}")
+        FalconCache._prune_backups()
+
+    def _backup_and_clear_file(self):
+        """Move the stale cache into the backup directory (encrypted only) and remove it.
+
+        Plaintext legacy caches are encrypted before being backed up; if that
+        isn't possible, the cache is deleted instead. Only the newest
+        ``MAX_CACHE_BACKUPS`` backups are kept.
+        """
+        try:
+            with open(CACHE_FILE, "rb") as f:
+                raw = f.read()
+            encrypted = self._encrypted_backup_bytes(raw)
+            if encrypted is not None:
+                os.makedirs(CACHE_BACKUP_DIR, mode=0o700, exist_ok=True)
+                os.chmod(CACHE_BACKUP_DIR, 0o700)
+                ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+                backup_path = os.path.join(CACHE_BACKUP_DIR, f"cache_{ts}.enc")
+                write_private_file(backup_path, encrypted)
+                logger.info(f"Old cache backed up to {backup_path}")
+            else:
+                logger.info("Old cache could not be stored encrypted — deleting instead of backing up")
+        except FileNotFoundError:
+            return
         except Exception as e:
             logger.warning(f"Failed to backup cache file: {e}")
-            # Still try to remove it
-            try:
-                os.remove(CACHE_FILE)
-            except Exception:
-                pass
+        try:
+            os.remove(CACHE_FILE)
+        except OSError:
+            pass
+        self._prune_backups()
 
     def check_cid_change(self) -> bool:
         """Check if CID changed since cache was initialized. If so, clear everything.
@@ -540,6 +642,46 @@ class FalconCache:
             lines.append("  IOC lookup supports: domain, ipv4, ipv6, md5, sha1, sha256")
             lines.append("")
 
+        # Top Affected Hosts (cross-referenced from all data sources)
+        host_issues: dict[str, dict] = {}
+
+        def _tally(cache_key: str, list_field: str, counter: str):
+            data = self.get_parsed(cache_key)
+            items = data.get(list_field, []) if isinstance(data, dict) else []
+            for item in items:
+                h = item.get("hostname")
+                if not h or h == "N/A":
+                    continue
+                entry = host_issues.setdefault(h, {"alerts": 0, "vulns": 0, "detections": 0, "platform": ""})
+                entry[counter] += 1
+                os_v = (item.get("os_version") or "").lower()
+                if os_v and not entry["platform"]:
+                    if "windows" in os_v:
+                        entry["platform"] = "Windows"
+                    elif any(k in os_v for k in ("linux", "ubuntu", "centos", "rhel")):
+                        entry["platform"] = "Linux"
+                    elif "mac" in os_v or "darwin" in os_v:
+                        entry["platform"] = "Mac"
+
+        _tally("alerts_critical", "alerts", "alerts")
+        _tally("alerts_high", "alerts", "alerts")
+        _tally("detections_recent", "detections", "detections")
+        _tally("vulnerabilities_critical", "vulnerabilities", "vulns")
+        if host_issues:
+            ranked = sorted(host_issues.items(), key=lambda x: sum([x[1]["alerts"], x[1]["vulns"], x[1]["detections"]]), reverse=True)
+            lines.append(f"## Top Affected Hosts ({len(ranked)} hosts with issues)")
+            for h, counts in ranked[:10]:
+                parts = []
+                if counts["alerts"]:
+                    parts.append(f"{counts['alerts']} alerts")
+                if counts["detections"]:
+                    parts.append(f"{counts['detections']} detections")
+                if counts["vulns"]:
+                    parts.append(f"{counts['vulns']} critical vulns")
+                plat = f" [{counts['platform']}]" if counts["platform"] else ""
+                lines.append(f"  - {h}{plat}: {', '.join(parts)}")
+            lines.append("")
+
         # Identity Protection
         data = self.get_parsed("identity_protection")
         if data and not isinstance(data, str) and "error" not in data:
@@ -608,166 +750,6 @@ class FalconCache:
         lines.append("=== END CACHED DATA ===")
 
         return "\n".join(lines)
-
-
-# ============ CID Profile Management ============
-
-ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-
-
-def parse_env_profiles() -> list[dict]:
-    """Parse .env file and extract CID credential profiles.
-
-    The .env uses a comment/uncomment pattern:
-        #profile_name
-        #FALCON_CLIENT_ID=xxx    (commented = inactive)
-        #FALCON_CLIENT_SECRET=xxx
-        #FALCON_BASE_URL=xxx
-
-    Active profile has uncommented FALCON_* lines.
-
-    Returns list of dicts: [{"name": str, "client_id": str, "base_url": str, "active": bool}]
-    """
-    if not os.path.exists(ENV_FILE):
-        return []
-
-    with open(ENV_FILE, "r") as f:
-        lines = f.readlines()
-
-    profiles = []
-    i = 0
-    while i < len(lines):
-        line = lines[i].rstrip()
-
-        # Look for a profile header comment: starts with # but is NOT a commented-out var
-        # and does not mention LLM config (which is not a CID profile)
-        if (line.startswith("#") and
-                not line.startswith("#FALCON_") and
-                not line.startswith("#LLM_") and
-                "llm_endpoint" not in line.lower() and "llm_api_key" not in line.lower() and
-                line.strip() and
-                "=" not in line.split()[0]):
-            profile_name = line.lstrip("#").strip()
-            if not profile_name:
-                i += 1
-                continue
-
-            # Scan ahead (up to 8 lines) for FALCON_CLIENT_ID/SECRET/BASE_URL
-            # Skip over LLM_ lines and empty lines
-            client_id = None
-            client_secret = None
-            base_url = None
-            active = None
-            line_start = i
-            j = i + 1
-            while j < len(lines) and j <= i + 8:
-                l = lines[j].rstrip()
-                if "FALCON_CLIENT_ID=" in l:
-                    is_commented = l.lstrip().startswith("#")
-                    val = l.lstrip("#").split("=", 1)[1].strip()
-                    client_id = val
-                    if active is None:
-                        active = not is_commented
-                elif "FALCON_CLIENT_SECRET=" in l:
-                    is_commented = l.lstrip().startswith("#")
-                    val = l.lstrip("#").split("=", 1)[1].strip()
-                    client_secret = val
-                elif "FALCON_BASE_URL=" in l:
-                    is_commented = l.lstrip().startswith("#")
-                    val = l.lstrip("#").split("=", 1)[1].strip()
-                    base_url = val
-                elif l.strip() == "" or "LLM_ENDPOINT" in l or "LLM_API_KEY" in l:
-                    # Skip empty lines and LLM config lines
-                    j += 1
-                    continue
-                elif l.startswith("#") and "=" not in l:
-                    # Next profile header — stop scanning
-                    break
-                j += 1
-
-            if client_id:
-                profiles.append({
-                    "name": profile_name,
-                    "client_id": client_id,
-                    "client_id_short": client_id[-8:] if len(client_id) >= 8 else client_id,
-                    "base_url": base_url or "https://api.crowdstrike.com",
-                    "active": bool(active),
-                    "line_start": line_start,
-                    "line_end": j - 1,
-                })
-            i = j
-        else:
-            i += 1
-
-    return profiles
-
-
-def switch_env_profile(target_name: str) -> bool:
-    """Rewrite .env to activate the profile with `target_name` and comment out others.
-
-    Returns True if profile was switched successfully.
-    """
-    if not os.path.exists(ENV_FILE):
-        return False
-
-    with open(ENV_FILE, "r") as f:
-        lines = f.readlines()
-
-    profiles = parse_env_profiles()
-    if not profiles:
-        return False
-
-    target = None
-    for p in profiles:
-        if p["name"] == target_name:
-            target = p
-            break
-    if not target:
-        return False
-
-    # Rewrite the file: comment out all FALCON_* lines, then uncomment the target profile's
-    new_lines = []
-    in_profile = None
-    for i, line in enumerate(lines):
-        stripped = line.rstrip()
-
-        # Check if this line is a profile header
-        is_header = False
-        for p in profiles:
-            if i == p["line_start"]:
-                in_profile = p["name"]
-                is_header = True
-                break
-
-        if is_header:
-            new_lines.append(line)
-            continue
-
-        # For FALCON_ variable lines, comment/uncomment based on target
-        if "FALCON_CLIENT_ID=" in stripped or "FALCON_CLIENT_SECRET=" in stripped or "FALCON_BASE_URL=" in stripped:
-            # Get the raw key=value (strip any leading #)
-            raw = stripped.lstrip("#")
-            if in_profile == target_name:
-                # Uncomment: write raw
-                new_lines.append(raw + "\n")
-            else:
-                # Comment out: ensure it starts with #
-                new_lines.append("#" + raw + "\n")
-        else:
-            new_lines.append(line)
-
-    # Write atomically
-    tmp_path = ENV_FILE + ".tmp"
-    with open(tmp_path, "w") as f:
-        f.writelines(new_lines)
-    os.replace(tmp_path, ENV_FILE)
-
-    # Reload env vars
-    from dotenv import load_dotenv
-    load_dotenv(ENV_FILE, override=True)
-
-    logger.info(f"Switched active CID profile to: {target_name}")
-    return True
 
 
 # Module-level convenience: import and use the singleton directly

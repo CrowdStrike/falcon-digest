@@ -28,18 +28,21 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
-from dotenv import load_dotenv
 from crwd_mcp_server import (
     get_host_details, test_fql_filter, list_available_products,
     search_cases, search_detections, search_vulnerabilities,
     search_threatgraph, get_security_posture, get_ngsiem_ingestion,
     get_identity_protection, get_cloud_security, get_exposure_management,
-    validate_config, ConfigError
+    validate_config, validate_llm_config, ConfigError, clear_client_cache
 )
-from mcp_api_client import call_llm, execute_tool, TOOL_DEFINITIONS
-from falcon_cache import cache as falcon_cache, parse_env_profiles, switch_env_profile
-
-load_dotenv()
+from mcp_api_client import (
+    call_llm, execute_tool, validate_response, TOOL_DEFINITIONS,
+    TURN_TIME_BUDGET_SECONDS, LLMTimeoutError,
+)
+from crwd_mcp_server import sanitize_error as _sanitize_error
+from falcon_cache import cache as falcon_cache
+from falcon_auth import UserManager, lockout_remaining
+from falcon_secrets import config_store, CLOUD_REGIONS, ConfigDecryptError
 
 _logger = logging.getLogger("falcon_mcp.dashboard")
 
@@ -52,23 +55,320 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ============ CONFIGURATION CHECK ============
+# ============ AUTHENTICATION GATE ============
+
+_user_mgr = UserManager()
+
+# Fail closed: never treat an unreadable users or config file as "first run"
+if _user_mgr.load_error:
+    st.error(
+        "The users file `.falcon_users.json` exists but could not be read, so the dashboard "
+        "will not start. Restore it from backup or fix its permissions, then reload. "
+        "Delete it only if you intend to reset every account."
+    )
+    st.stop()
+if config_store.load_error:
+    config_store.reload()  # recovers without a restart once the key is reachable again
+if config_store.load_error:
+    st.error(
+        f"{config_store.load_error} The dashboard will not overwrite it. Make sure this process "
+        "can reach the same OS keychain or key file the config was created with, then reload. "
+        "Details are in the server log."
+    )
+    st.stop()
+
+_IDLE_TIMEOUT_SECONDS = 8 * 3600
+
+
+def _logout() -> None:
+    """End the session and drop every piece of session data (chat, tab data, flags)."""
+    st.session_state.clear()
+    st.session_state.authenticated = False
+    st.session_state.current_user = None
+
+
+def _client_id() -> str:
+    """Identify the client for login throttling: its IP, else this browser session."""
+    ip = getattr(st.context, "ip_address", None)
+    if isinstance(ip, str) and ip:
+        return ip
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        ctx = get_script_run_ctx()
+        if ctx is not None:
+            return f"session:{ctx.session_id}"
+    except Exception:
+        pass
+    return ""
+
+
+def _require_user(role: str | None = None) -> bool:
+    """Re-validate the logged-in user against the users file.
+
+    Used at the top of every run, inside fragments (which rerun without the
+    module-level gate) and inside widget callbacks (which run before the
+    script, with the previous run's role). Logs the session out if the user
+    was removed, their password/role changed (session version bump) or the
+    session was idle too long.
+
+    Args:
+        role: If ``"admin"``, also require the admin role.
+
+    Returns:
+        True if the session is valid (and has ``role`` if given).
+    """
+    current = st.session_state.get("current_user") or {}
+    if not st.session_state.get("authenticated") or not current:
+        return False
+    fresh = UserManager().get_user(current.get("username", ""))
+    now = time.time()
+    idle = now - st.session_state.get("_last_activity", now)
+    if not fresh or fresh.get("epoch", 0) != current.get("epoch", 0) or idle > _IDLE_TIMEOUT_SECONDS:
+        _logout()
+        return False
+    st.session_state.current_user = fresh
+    st.session_state["_last_activity"] = now
+    return role is None or fresh.get("role") == role
+
+
+def _flash(message: str) -> None:
+    """Queue a success message to show after the next rerun."""
+    st.session_state["_flash"] = message
+
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+    st.session_state.current_user = None
+
+
+@st.cache_resource(show_spinner=False)
+def _announce_setup_token(token: str) -> None:
+    """Print the first-run setup token to the server console (once per token per process)."""
+    print(
+        "\n" + "=" * 64
+        + "\n  Falcon Digest first-run setup token:\n\n    " + token
+        + "\n\n  Enter it in the browser to create the admin account."
+        + "\n" + "=" * 64 + "\n",
+        flush=True,
+    )
+
+
+if not _user_mgr.has_users():
+    _announce_setup_token(_user_mgr.get_or_create_setup_token())
+    st.markdown(
+        '<div style="max-width:440px; margin:60px auto; text-align:center;">'
+        '<h2 style="color:#EC0000;">Falcon Digest — Initial Setup</h2>'
+        '<p style="color:#6B7280;">Create an admin account to get started. The setup token '
+        'is printed in the terminal running <code>streamlit run</code> and stored in '
+        '<code>.falcon_users.json.setup</code> in the data directory (<code>~/.falcon-digest</code> by default).</p></div>',
+        unsafe_allow_html=True
+    )
+    with st.form("setup_form"):
+        setup_token = st.text_input("Setup token", type="password")
+        setup_user = st.text_input("Username", placeholder="admin")
+        setup_pw = st.text_input("Password", type="password", placeholder="Min 8 characters")
+        setup_pw2 = st.text_input("Confirm Password", type="password")
+        setup_submit = st.form_submit_button("Create Admin Account", type="primary")
+        if setup_submit:
+            if not _user_mgr.verify_setup_token(setup_token):
+                st.error("Invalid setup token.")
+            elif setup_pw != setup_pw2:
+                st.error("Passwords do not match.")
+            else:
+                err = _user_mgr.add_user(setup_user, setup_pw, role="admin", require_no_users=True)
+                if err:
+                    st.error(err)
+                else:
+                    _user_mgr.consume_setup_token()
+                    st.session_state.authenticated = True
+                    st.session_state.current_user = UserManager().get_user(setup_user)
+                    st.session_state["_last_activity"] = time.time()
+                    st.rerun()
+    st.stop()
+
+if not st.session_state.authenticated:
+    st.markdown(
+        '<div style="max-width:400px; margin:80px auto; text-align:center;">'
+        '<h2 style="color:#EC0000;">Falcon Digest</h2>'
+        '<p style="color:#6B7280;">Login to access the dashboard</p></div>',
+        unsafe_allow_html=True
+    )
+    with st.form("login_form"):
+        login_user = st.text_input("Username", placeholder="Username")
+        login_pw = st.text_input("Password", type="password", placeholder="Password")
+        submitted = st.form_submit_button("Login", type="primary")
+        if submitted:
+            _client = _client_id()
+            result = _user_mgr.authenticate(login_user, login_pw, client=_client)
+            if result:
+                st.session_state.clear()  # nothing from a previous user survives
+                st.session_state.authenticated = True
+                st.session_state.current_user = result
+                st.session_state["_last_activity"] = time.time()
+                st.rerun()
+            _wait = lockout_remaining(login_user, _client)
+            if _wait:
+                st.error(f"Too many failed attempts. Try again in {int(_wait) + 1}s.")
+            else:
+                st.error("Invalid username or password.")
+    st.stop()
+
+# Re-validate on every run so removals, role/password changes and idle expiry apply to live sessions
+if not _require_user():
+    st.rerun()
+
+
+def _is_admin() -> bool:
+    return (st.session_state.get("current_user") or {}).get("role") == "admin"
+
+
+# ============ CONFIGURATION & SETTINGS ============
+
+_SESSION_DATA_KEYS = [
+    "posture_data", "detections_data", "cases_data", "vulns_data",
+    "tg_edge_types", "ingestion_data", "identity_data",
+    "cloud_security_data", "exposure_data", "_cache_sync_count",
+]
+
+
+def _apply_config_change() -> bool:
+    """Push the stored config into the process env and drop data from a previous CID.
+
+    Returns:
+        True if the active CID changed (cache cleared and refresh started).
+    """
+    config_store.inject_to_env()
+    clear_client_cache()
+    if falcon_cache.check_cid_change():
+        for key in _SESSION_DATA_KEYS:
+            st.session_state.pop(key, None)
+        falcon_cache.force_refresh()
+        return True
+    return False
+
+
+def _on_cid_select() -> None:
+    """Switch the active CID only when this admin actually changes the sidebar selector."""
+    if not _require_user("admin"):
+        return
+    choice = st.session_state.get("cid_profile_select")
+    if choice and choice != config_store.get_active_profile_name():
+        config_store.set_active_profile(choice)
+        _apply_config_change()
+        st.session_state["_cid_switching"] = True
+
+
+def _render_settings_page():
+    """Render the Settings page for Falcon API and LLM configuration (admins only)."""
+    st.markdown(
+        '<h2 style="color:#EC0000;">Settings</h2>'
+        '<p style="color:#6B7280;">Configure Falcon API credentials and LLM settings.</p>',
+        unsafe_allow_html=True
+    )
+    if not _require_user("admin"):
+        st.info("Only an admin can change settings. Ask an admin to update the configuration.")
+        return
+    if st.session_state.get("_flash"):
+        st.success(st.session_state.pop("_flash"))
+    if config_store.migration_warning:
+        st.warning(config_store.migration_warning)
+
+    # --- CID Profiles ---
+    st.subheader("CrowdStrike Falcon API Profiles")
+    profiles = config_store.list_profiles()
+    if profiles:
+        for p in profiles:
+            marker = " (active)" if p["active"] else ""
+            cols = st.columns([3, 1, 1])
+            cols[0].markdown(f"**{html.escape(p['name'])}**{marker} &mdash; `...{html.escape(p['client_id_short'])}` &mdash; {html.escape(p['base_url'])}")
+            if not p["active"]:
+                if cols[1].button("Activate", key=f"activate_{p['name']}"):
+                    config_store.set_active_profile(p["name"])
+                    _apply_config_change()
+                    st.rerun()
+            if cols[2].button("Delete", key=f"delete_{p['name']}"):
+                config_store.delete_profile(p["name"])
+                _apply_config_change()
+                st.rerun()
+        st.divider()
+
+    st.markdown("**Add / Edit Profile**")
+    st.caption("To update an existing profile, enter its name. Leave the secret blank to keep the stored one.")
+    with st.form("profile_form", clear_on_submit=True):
+        pcol1, pcol2 = st.columns(2)
+        profile_name = pcol1.text_input("Profile Name", value="default" if not profiles else "", placeholder="e.g. prod-us1")
+        cloud_region = pcol2.selectbox("Cloud Region", list(CLOUD_REGIONS.keys()), index=0)
+        client_id = st.text_input("Client ID", placeholder="Falcon API Client ID")
+        client_secret = st.text_input("Client Secret", type="password", placeholder="Falcon API Client Secret")
+        if st.form_submit_button("Save Profile", type="primary"):
+            try:
+                config_store.save_profile(profile_name, client_id, client_secret, CLOUD_REGIONS[cloud_region])
+            except (ValueError, ConfigDecryptError) as e:
+                st.error(_sanitize_error(e, max_len=400))
+            else:
+                _apply_config_change()
+                _flash(f"Profile '{profile_name.strip()}' saved.")
+                st.rerun()
+
+    # --- LLM Settings ---
+    st.subheader("LLM / AI Chat (optional)")
+    llm = config_store.get_llm_config()  # never includes the stored API key
+    with st.form("llm_form"):
+        llm_endpoint = st.text_input("LLM Endpoint", value=llm.get("LLM_ENDPOINT", ""), placeholder="https://api.anthropic.com or http://localhost:11434")
+        llm_key = st.text_input(
+            "LLM API Key", type="password",
+            placeholder="Stored — leave blank to keep" if llm.get("LLM_API_KEY_SET") else "Not needed for local models",
+        )
+        clear_key = st.checkbox("Clear stored API key", value=False, disabled=not llm.get("LLM_API_KEY_SET"))
+        lcol1, lcol2 = st.columns(2)
+        llm_provider = lcol1.selectbox("Provider", ["anthropic", "openai"], index=0 if llm.get("LLM_PROVIDER", "anthropic") == "anthropic" else 1)
+        llm_model = lcol2.text_input("Model Override", value=llm.get("LLM_MODEL", ""), placeholder="Leave blank for default")
+        _modes = {"auto": "Auto (detect from endpoint)", "local": "Local small model (no tools)", "full": "Full model (tools)"}
+        _mode_keys = list(_modes)
+        llm_local_mode = st.selectbox(
+            "Model type", _mode_keys, format_func=_modes.get,
+            index=_mode_keys.index(llm.get("LLM_LOCAL_MODE", "auto")) if llm.get("LLM_LOCAL_MODE", "auto") in _modes else 0,
+            help="Auto treats loopback, private-network and .local endpoints as small local models.",
+        )
+        if st.form_submit_button("Save LLM Settings", type="primary"):
+            api_key = "" if clear_key else (llm_key or None)
+            try:
+                config_store.save_llm_config(llm_endpoint, api_key, llm_provider, llm_model, llm_local_mode)
+            except ConfigDecryptError as e:
+                st.error(_sanitize_error(e, max_len=400))
+            else:
+                config_store.inject_to_env()
+                _flash("LLM settings saved.")
+                st.rerun()
+
+
+def _render_setup_required(message: str):
+    """Show Settings to admins, or a contact-an-admin notice to viewers, then stop."""
+    if _is_admin():
+        st.info(message)
+        _render_settings_page()
+    else:
+        st.warning(f"{message} Ask an admin to finish the configuration.")
+    if st.button("Logout", key="setup_logout_btn"):
+        _logout()
+        st.rerun()
+    st.stop()
+
+
+config_store.inject_to_env()
+
+_ENV_MODE = False
+if not config_store.has_config():
+    try:
+        validate_config()  # Falcon credentials supplied via the process environment
+        _ENV_MODE = True
+    except ConfigError:
+        _render_setup_required("Add a Falcon API profile to get started.")
 
 try:
     validate_config()
 except ConfigError as e:
-    st.error(
-        "**Falcon Digest cannot start — required configuration is missing.**\n\n"
-        + str(e).replace("\n", "\n\n"),
-        icon="\u274C"
-    )
-    st.info(
-        "Copy `.env.example` to `.env` and fill in your credentials, "
-        "then reload this page.\n\n"
-        "```bash\ncp .env.example .env\n```",
-        icon="\u2139\uFE0F"
-    )
-    st.stop()
+    _render_setup_required(_sanitize_error(e, max_len=400))
 
 # ============ THEME CSS ============
 
@@ -269,10 +569,7 @@ st.markdown("""
 # Detect CID change — clear all session state and cache if credentials switched
 if falcon_cache.check_cid_change():
     _logger.info("CID change detected — clearing session state")
-    for key in ["posture_data", "detections_data", "cases_data", "vulns_data",
-                 "tg_edge_types", "ingestion_data", "identity_data",
-                 "cloud_security_data", "exposure_data", "cache_started",
-                 "_cache_sync_count"]:
+    for key in _SESSION_DATA_KEYS + ["cache_started"]:
         st.session_state.pop(key, None)
 
 if "cache_started" not in st.session_state:
@@ -284,10 +581,15 @@ if "cache_started" not in st.session_state:
         else:
             st.session_state.cache_loaded_from_file = False
             falcon_cache.start(poll_interval=300, ttl=300)
-            # Wait for initial cache load with progress
+            # start() is a no-op if the poller is already running (e.g. the cache was
+            # just cleared by a CID change), so kick a refresh rather than wait for the next poll
+            if not falcon_cache.is_refreshing and falcon_cache.entry_count == 0:
+                falcon_cache.force_refresh()
+            # Wait for initial cache load with progress (bounded, so a stuck fetch can't hang the page)
             _init_progress = st.empty()
             _init_status = st.empty()
-            while falcon_cache.is_refreshing or falcon_cache.entry_count == 0:
+            _init_deadline = time.monotonic() + 120
+            while (falcon_cache.is_refreshing or falcon_cache.entry_count == 0) and time.monotonic() < _init_deadline:
                 pct = falcon_cache.refresh_progress
                 _init_progress.progress(pct, text=f"Loading Falcon data... {int(pct * 100)}%")
                 status = falcon_cache.refresh_status
@@ -412,10 +714,12 @@ def render_kpi_card(label: str, value, color: str = "#E8272C", delta=None, delta
         else:
             css_cls = "up-good" if delta > 0 else "down-bad"  # up=green(good), down=red(bad)
         delta_html = f'<div class="kpi-delta {css_cls}">{arrow} {sign}{delta}</div>'
+    safe_label = html.escape(str(label))
+    safe_value = html.escape(str(value))
     st.markdown(f"""
     <div class="kpi-card">
-        <div class="kpi-label">{label}</div>
-        <div class="kpi-value" style="color: {color};">{value}</div>
+        <div class="kpi-label">{safe_label}</div>
+        <div class="kpi-value" style="color: {color};">{safe_value}</div>
         {delta_html}
     </div>
     """, unsafe_allow_html=True)
@@ -622,25 +926,13 @@ _SCROLL_JS = """
 
 
 def stream_to_chat(container, text, label="Falcon Digest"):
-    """Stream text word-by-word into a chat container with typewriter effect."""
+    """Render assistant text into a chat container."""
     text = html.escape(text)
     with container:
-        placeholder = st.empty()
-        streamed = ""
-        words = text.split(' ')
-        for i, word in enumerate(words):
-            streamed += word + (' ' if i < len(words) - 1 else '')
-            placeholder.markdown(
-                f'<div class="chat-assistant"><strong>{label}:</strong> {streamed}▌</div>',
-                unsafe_allow_html=True
-            )
-            time.sleep(0.02)
-        # Final render without cursor
-        placeholder.markdown(
+        st.markdown(
             f'<div class="chat-assistant"><strong>{label}:</strong> {text}</div>',
             unsafe_allow_html=True
         )
-        # Auto-scroll to bottom
         components.html(_SCROLL_JS, height=0)
 
 
@@ -649,56 +941,63 @@ def stream_to_chat(container, text, label="Falcon Digest"):
 with st.sidebar:
     st.markdown(f'<div style="display:flex; align-items:center; gap:8px;"><span style="display:inline-flex; align-items:center; height:24px; width:24px;">{_CS_FALCON_SVG}</span><h3 style="color: #EC0000; margin: 0; padding: 0; line-height: 1;">Falcon Digest</h3></div>', unsafe_allow_html=True)
 
+    _cur_user = st.session_state.get("current_user", {})
+    _role_badge = " (admin)" if _cur_user.get("role") == "admin" else ""
+    _user_cols = st.columns([3, 1])
+    with _user_cols[0]:
+        st.caption(f"Logged in as **{html.escape(_cur_user.get('username', ''))}**{_role_badge}")
+    with _user_cols[1]:
+        if st.button("Logout", key="logout_btn", type="secondary"):
+            _logout()
+            st.rerun()
+
     st.markdown(
         '<span class="status-dot status-connected"></span> **Falcon API Connected**',
         unsafe_allow_html=True
     )
 
-    # --- CID Profile Selector ---
-    env_profiles = parse_env_profiles()
-    if len(env_profiles) > 1:
-        profile_names = [p["name"] for p in env_profiles]
-        active_idx = next((i for i, p in enumerate(env_profiles) if p["active"]), 0)
-        selected_profile = st.selectbox(
+    # --- CID Profile Selector (admin only: switching changes the CID for every session) ---
+    _cfg_profiles = config_store.list_profiles()
+    if len(_cfg_profiles) > 1 and _is_admin():
+        _profile_names = [p["name"] for p in _cfg_profiles]
+        # Always mirror the active profile, so a stale per-session value (e.g. after
+        # Settings -> Activate or another admin's switch) never switches it back
+        st.session_state["cid_profile_select"] = config_store.get_active_profile_name() or _profile_names[0]
+        st.selectbox(
             "CID Profile",
-            profile_names,
-            index=active_idx,
+            _profile_names,
             format_func=lambda n: next(
-                (f"{p['name']}  ({p['client_id_short']})" for p in env_profiles if p["name"] == n), n
+                (f"{p['name']}  ({p['client_id_short']})" for p in _cfg_profiles if p["name"] == n), n
             ),
             key="cid_profile_select",
+            on_change=_on_cid_select,
         )
-        if selected_profile != env_profiles[active_idx]["name"]:
-            if switch_env_profile(selected_profile):
-                # Clear caches and session state
-                from crwd_mcp_server import clear_client_cache
-                try:
-                    clear_client_cache()
-                except Exception:
-                    pass
-                falcon_cache.check_cid_change()
-                for key in ["posture_data", "detections_data", "cases_data", "vulns_data",
-                             "tg_edge_types", "ingestion_data", "identity_data",
-                             "cloud_security_data", "exposure_data",
-                             "_cache_sync_count"]:
-                    st.session_state.pop(key, None)
-                falcon_cache.force_refresh()
-                time.sleep(0.2)
-                _cid_prog = st.empty()
-                _cid_stat = st.empty()
-                while falcon_cache.is_refreshing:
-                    pct = falcon_cache.refresh_progress
-                    _cid_prog.progress(pct, text=f"Switching CID... {int(pct * 100)}%")
-                    status = falcon_cache.refresh_status
-                    loading = [k for k, v in status.items() if v == "loading"]
-                    if loading:
-                        _cid_stat.caption(f"Fetching: {', '.join(loading)}")
-                    time.sleep(0.3)
-                _cid_prog.empty()
-                _cid_stat.empty()
-                st.rerun()
+        if st.session_state.pop("_cid_switching", False):
+            time.sleep(0.2)
+            _cid_prog = st.empty()
+            _cid_stat = st.empty()
+            while falcon_cache.is_refreshing:
+                pct = falcon_cache.refresh_progress
+                _cid_prog.progress(pct, text=f"Switching CID... {int(pct * 100)}%")
+                status = falcon_cache.refresh_status
+                loading = [k for k, v in status.items() if v == "loading"]
+                if loading:
+                    _cid_stat.caption(f"Fetching: {', '.join(loading)}")
+                time.sleep(0.3)
+            _cid_prog.empty()
+            _cid_stat.empty()
+            st.rerun()
+    elif _ENV_MODE:
+        st.caption("Using credentials from the process environment")
     else:
-        st.caption("Credentials loaded from .env")
+        _active = config_store.get_active_profile_name()
+        st.caption(f"Profile: {html.escape(_active)}" if _active else "Config loaded")
+
+    # --- Settings link (admin only) ---
+    if _is_admin():
+        if st.button("Settings", key="sidebar_settings_btn", width="stretch"):
+            st.session_state["_show_settings"] = True
+            st.rerun()
 
     # Subscriptions + API Scopes — render from session state or cache
     _posture_for_sidebar = st.session_state.get("posture_data")
@@ -786,9 +1085,9 @@ with st.sidebar:
         if errs:
             with st.expander(f"Cache Errors ({len(errs)})"):
                 for e in errs:
-                    st.caption(e)
-        # Cache restart button
-        if st.button("Refresh Cache Now", key="cache_refresh_btn", width="stretch"):
+                    st.caption(_sanitize_error(e))
+        # Cache controls change shared state for every session — admins only
+        if _is_admin() and st.button("Refresh Cache Now", key="cache_refresh_btn", width="stretch"):
             falcon_cache.force_refresh()
             time.sleep(0.2)
             _prog = st.empty()
@@ -809,7 +1108,7 @@ with st.sidebar:
             '<span class="status-dot status-disconnected"></span> **Data Cache Inactive**',
             unsafe_allow_html=True
         )
-        if st.button("Start Cache", key="cache_start_btn", width="stretch"):
+        if _is_admin() and st.button("Start Cache", key="cache_start_btn", width="stretch"):
             falcon_cache.start(poll_interval=300, ttl=300)
             st.rerun()
 
@@ -820,12 +1119,62 @@ with st.sidebar:
         refresh_interval = st.slider("Refresh interval (sec)", 30, 300, 60)
         st.caption(f"Refreshing every {refresh_interval}s")
 
-    cache_interval = st.slider("Cache poll interval (sec)", 60, 600, 300, key="cache_poll")
-    if falcon_cache.is_running and falcon_cache.poll_interval != cache_interval:
-        falcon_cache.poll_interval = cache_interval
-        falcon_cache.ttl = cache_interval
+    if _is_admin():
+        cache_interval = st.slider("Cache poll interval (sec)", 60, 600,
+                                   min(max(int(falcon_cache.poll_interval), 60), 600), key="cache_poll")
+        if falcon_cache.is_running and falcon_cache.poll_interval != cache_interval:
+            falcon_cache.poll_interval = cache_interval
+            falcon_cache.ttl = cache_interval
 
     st.divider()
+
+    if _cur_user.get("role") == "admin":
+        with st.expander("User Management"):
+            _mgmt_tab_add, _mgmt_tab_list = st.tabs(["Add User", "Manage Users"])
+            with _mgmt_tab_add:
+                with st.form("add_user_form", clear_on_submit=True):
+                    _new_user = st.text_input("Username", placeholder="username", key="mgmt_new_user")
+                    _new_pw = st.text_input("Password", type="password", placeholder="Min 8 characters", key="mgmt_new_pw")
+                    _new_role = st.selectbox("Role", ["viewer", "admin"], key="mgmt_new_role")
+                    if st.form_submit_button("Add User"):
+                        _err = _user_mgr.add_user(_new_user, _new_pw, _new_role)
+                        if _err:
+                            st.error(_err)
+                        else:
+                            st.success(f"User '{_new_user.strip().lower()}' created.")
+            with _mgmt_tab_list:
+                for _u in _user_mgr.list_users():
+                    _u_name = _u["username"]
+                    _u_cols = st.columns([2, 1, 1])
+                    with _u_cols[0]:
+                        st.markdown(f"**{html.escape(_u_name)}** ({html.escape(_u['role'])})")
+                    with _u_cols[1]:
+                        if _u_name != _cur_user.get("username"):
+                            if st.button("Remove", key=f"rm_{_u_name}"):
+                                _err = _user_mgr.remove_user(_u_name)
+                                if _err:
+                                    st.error(_err)
+                                else:
+                                    st.rerun()
+                    with _u_cols[2]:
+                        _new_r = "admin" if _u["role"] == "viewer" else "viewer"
+                        if st.button(f"Make {_new_r}", key=f"role_{_u_name}"):
+                            _err = _user_mgr.change_role(_u_name, _new_r)
+                            if _err:
+                                st.error(_err)
+                            else:
+                                st.rerun()
+                st.divider()
+                st.markdown("**Change Password**")
+                with st.form("change_pw_form", clear_on_submit=True):
+                    _cp_user = st.selectbox("User", [u["username"] for u in _user_mgr.list_users()], key="mgmt_cp_user")
+                    _cp_pw = st.text_input("New Password", type="password", key="mgmt_cp_pw")
+                    if st.form_submit_button("Change Password"):
+                        _err = _user_mgr.change_password(_cp_user, _cp_pw)
+                        if _err:
+                            st.error(_err)
+                        else:
+                            st.success(f"Password changed for '{_cp_user}'.")
 
     with st.expander("FQL Quick Reference"):
         st.code("field:'value'          # Exact match")
@@ -862,7 +1211,12 @@ st.markdown(f"""
 
 # ============ GLOBAL REPORTING PERIOD ============
 
+_PERIOD_OPTIONS = [6, 12, 24, 48, 72, 168]
+
+
 def _on_global_hours_change():
+    if not _require_user("admin"):  # callbacks run before the script, with last run's role
+        return
     new_hours = st.session_state.get("global_hours", 24)
     # Update cache reporting window — triggers background refresh with new hours
     falcon_cache.set_hours(new_hours)
@@ -885,10 +1239,24 @@ with _period_ts:
             _ago_str = _last_refresh.strftime("%H:%M")
         st.markdown(f'<div style="text-align:right; padding-top:8px; font-size:0.8rem; color:#6B7280;">Updated {_ago_str}</div>', unsafe_allow_html=True)
 with _period_col:
-    st.selectbox("Period", [6, 12, 24, 48, 72, 168], index=5,
+    # The reporting window is shared cache state: admins change it, viewers see the current one
+    if not _is_admin() or "global_hours" not in st.session_state:
+        st.session_state["global_hours"] = falcon_cache.hours if falcon_cache.hours in _PERIOD_OPTIONS else 24
+    st.selectbox("Period", _PERIOD_OPTIONS,
                  format_func=lambda x: f"Last {x}h" if x < 168 else "Last 7d",
                  key="global_hours", on_change=_on_global_hours_change,
+                 disabled=not _is_admin(),
+                 help=None if _is_admin() else "Only admins can change the reporting period.",
                  label_visibility="collapsed")
+
+# ============ SETTINGS PAGE (on-demand) ============
+
+if st.session_state.get("_show_settings") and _is_admin():
+    _render_settings_page()
+    if st.button("Back to Dashboard"):
+        del st.session_state["_show_settings"]
+        st.rerun()
+    st.stop()
 
 # ============ TABS ============
 
@@ -1290,7 +1658,7 @@ with tab_exec:
         errors = []
         for source in ["cases", "detections", "vulnerabilities"]:
             if data.get(source, {}).get("error"):
-                errors.append(f"**{source.title()}**: {data[source]['error']}")
+                errors.append(f"**{source.title()}**: {_sanitize_error(data[source]['error'])}")
         if errors:
             with st.expander("API Errors", expanded=False):
                 for err in errors:
@@ -1325,9 +1693,9 @@ with tab_detections:
             if data and "error" not in data:
                 st.session_state["detections_data"] = data
             elif data and "error" in data:
-                st.error(data["error"])
+                st.error(_sanitize_error(data["error"]))
             else:
-                st.error(result)
+                st.error(_sanitize_error(result))
 
     # Auto-load on first visit: try cache, fallback to live API
     if "detections_data" not in st.session_state:
@@ -1548,9 +1916,9 @@ with tab_cases:
             if data and "error" not in data:
                 st.session_state["cases_data"] = data
             elif data and "error" in data:
-                st.error(data["error"])
+                st.error(_sanitize_error(data["error"]))
             else:
-                st.error(result)
+                st.error(_sanitize_error(result))
 
     # Auto-load on first visit: try cache, fallback to live API
     if "cases_data" not in st.session_state:
@@ -1692,9 +2060,9 @@ with tab_vulns:
             if data and "error" not in data:
                 st.session_state["vulns_data"] = data
             elif data and "error" in data:
-                st.error(data["error"])
+                st.error(_sanitize_error(data["error"]))
             else:
-                st.error(result)
+                st.error(_sanitize_error(result))
 
     # Auto-load on first visit: try cache, fallback to live API
     if "vulns_data" not in st.session_state:
@@ -1862,7 +2230,7 @@ if tab_identity is not None:
     idp_data = st.session_state.get("identity_data")
     if idp_data:
         if idp_data.get("error"):
-            st.warning(f"Identity Protection: {idp_data['error']}")
+            st.warning(f"Identity Protection: {_sanitize_error(idp_data['error'])}")
             render_scope_hint("Identity Protection:read")
         else:
             # KPI row
@@ -2094,9 +2462,9 @@ if tab_identity is not None:
                     factors = entity.get("risk_factors", [])
                     if factors:
                         _admin_tag = " &#128272;" if entity.get("is_admin") else ""
-                        _dept_tag = f" | {entity.get('department')}" if entity.get("department") else ""
+                        _dept_tag = f" | {html.escape(str(entity.get('department')))}" if entity.get("department") else ""
                         st.markdown(
-                            f"**{entity.get('display_name', 'N/A')}** "
+                            f"**{html.escape(str(entity.get('display_name') or 'N/A'))}** "
                             f"(score: {entity.get('risk_score', 'N/A')}{_dept_tag}){_admin_tag}",
                             unsafe_allow_html=True
                         )
@@ -2153,7 +2521,7 @@ if tab_cloud is not None:
     cs_data = st.session_state.get("cloud_security_data")
     if cs_data:
         if cs_data.get("error"):
-            st.warning(f"Cloud Security: {cs_data['error']}")
+            st.warning(f"Cloud Security: {_sanitize_error(cs_data['error'])}")
             render_scope_hint("Cloud Security:read")
         else:
             # KPI row
@@ -2367,7 +2735,7 @@ if tab_exposure is not None:
     em_data = st.session_state.get("exposure_data")
     if em_data:
         if em_data.get("error"):
-            st.warning(f"Exposure Management: {em_data['error']}")
+            st.warning(f"Exposure Management: {_sanitize_error(em_data['error'])}")
             render_scope_hint("Exposure Management:read")
         else:
             # KPI row
@@ -2585,9 +2953,9 @@ with tab_tg:
                 if data and "error" not in data:
                     st.session_state["tg_data"] = data
                 elif data and "error" in data:
-                    st.error(data["error"])
+                    st.error(_sanitize_error(data["error"]))
                 else:
-                    st.error(result)
+                    st.error(_sanitize_error(result))
         else:
             st.warning("Enter an IOC value to search")
 
@@ -2642,9 +3010,9 @@ if tab_ingestion is not None:
 
         # Partial-results warning
         if top_error and sources:
-            st.warning(f"Partial results: {top_error}")
+            st.warning(f"Partial results: {_sanitize_error(top_error)}")
         elif top_error and not sources:
-            st.warning(f"Could not query NGSIEM: {top_error}")
+            st.warning(f"Could not query NGSIEM: {_sanitize_error(top_error)}")
             render_scope_hint("NGSIEM:read")
 
         # ---- KPI ROW ----
@@ -2802,7 +3170,7 @@ with tab_fql:
                         if data.get("tags"):
                             st.write("**Tags:**", ", ".join(data["tags"]))
                     else:
-                        st.error(result)
+                        st.error(_sanitize_error(result))
             else:
                 st.warning("Enter a hostname")
 
@@ -2823,66 +3191,87 @@ with tab_fql:
 # ============ TAB 11: AI CHAT ============
 
 with tab_chat:
-    st.subheader("Ask Falcon Digest")
-    st.caption("Powered by CrowdStrike Falcon Platform with full MCP tool access")
 
-    if "chat_messages" not in st.session_state:
-        st.session_state.chat_messages = []
+    @st.fragment
+    def _chat_fragment():
+        # Fragment reruns skip the module-level auth gate, so re-check here
+        if not _require_user():
+            st.rerun(scope="app")
+        st.subheader("Ask Falcon Digest")
+        st.caption("Powered by CrowdStrike Falcon Platform with full MCP tool access")
 
-    st.markdown("**Quick Actions**")
-    prompt_cols = st.columns(5)
-    guided_prompts = [
-        "Triage critical cases from the last 24h",
-        "Show my security posture overview",
-        "What are the top vulnerabilities I should patch?",
-        "Hunt for suspicious IOCs in the last 7 days",
-        "Generate an executive security briefing"
-    ]
-    for idx, (col, prompt_text) in enumerate(zip(prompt_cols, guided_prompts)):
-        with col:
-            if st.button(prompt_text, key=f"guided_{idx}", width="stretch"):
-                st.session_state.chat_pending = prompt_text
-
-    # Fixed-height scrollable chat window
-    chat_container = st.container(height=500)
-    with chat_container:
-        if not st.session_state.chat_messages:
-            st.markdown(
-                '<div style="text-align:center; color:#9CA3AF; padding:40px 0;">'
-                'Ask a question or use a Quick Action above to get started.</div>',
-                unsafe_allow_html=True
-            )
-        for msg in st.session_state.chat_messages:
-            if msg["role"] == "user":
-                st.markdown(f'<div class="chat-user"><strong>You:</strong> {html.escape(msg["content"])}</div>', unsafe_allow_html=True)
-            elif msg["role"] == "assistant":
-                st.markdown(f'<div class="chat-assistant"><strong>Falcon Digest:</strong> {html.escape(msg["content"])}</div>', unsafe_allow_html=True)
-            elif msg["role"] == "tool_call":
-                with st.expander(f"Tool: {msg['tool_name']}", expanded=False):
-                    st.json(msg.get("input", {}))
-                    if msg.get("result"):
-                        parsed = safe_json_parse(msg["result"])
-                        if parsed:
-                            st.json(parsed)
-                        else:
-                            st.text(msg["result"])
-
-        # Auto-scroll is handled after new messages are sent (below)
-
-    chat_input = st.chat_input("Ask about your security environment...")
-    pending_msg = st.session_state.pop("chat_pending", None)
-    active_input = pending_msg or chat_input
-
-    if active_input:
-        st.session_state.chat_messages.append({"role": "user", "content": active_input})
-        with chat_container:
-            st.markdown(f'<div class="chat-user"><strong>You:</strong> {html.escape(active_input)}</div>', unsafe_allow_html=True)
-            components.html(_SCROLL_JS, height=0)
-        api_messages = [{"role": "user", "content": active_input}]
+        if "chat_messages" not in st.session_state:
+            st.session_state.chat_messages = []
 
         try:
-            with st.spinner("Falcon Digest is thinking..."):
-                response = call_llm(api_messages, TOOL_DEFINITIONS)
+            validate_llm_config()
+        except ConfigError:
+            st.info("AI chat isn't configured yet. "
+                    + ("Open **Settings** in the sidebar to add an LLM endpoint." if _is_admin()
+                       else "Ask an admin to add an LLM endpoint in Settings."))
+            return
+
+        st.markdown("**Quick Actions**")
+        prompt_cols = st.columns(5)
+        guided_prompts = [
+            "Triage critical cases from the last 24h",
+            "Show my security posture overview",
+            "What are the top vulnerabilities I should patch?",
+            "Hunt for suspicious IOCs in the last 7 days",
+            "Generate an executive security briefing"
+        ]
+        for idx, (col, prompt_text) in enumerate(zip(prompt_cols, guided_prompts)):
+            with col:
+                if st.button(prompt_text, key=f"guided_{idx}", width="stretch"):
+                    st.session_state.chat_pending = prompt_text
+
+        # Fixed-height scrollable chat window
+        chat_container = st.container(height=500)
+        with chat_container:
+            if not st.session_state.chat_messages:
+                st.markdown(
+                    '<div style="text-align:center; color:#9CA3AF; padding:40px 0;">'
+                    'Ask a question or use a Quick Action above to get started.</div>',
+                    unsafe_allow_html=True
+                )
+            for msg in st.session_state.chat_messages:
+                if msg["role"] == "user":
+                    st.markdown(f'<div class="chat-user"><strong>You:</strong> {html.escape(msg["content"])}</div>', unsafe_allow_html=True)
+                elif msg["role"] == "assistant":
+                    st.markdown(f'<div class="chat-assistant"><strong>Falcon Digest:</strong> {html.escape(msg["content"])}</div>', unsafe_allow_html=True)
+                elif msg["role"] == "tool_call":
+                    with st.expander(f"Tool: {msg['tool_name']}", expanded=False):
+                        st.json(msg.get("input", {}))
+                        if msg.get("result"):
+                            parsed = safe_json_parse(msg["result"])
+                            if parsed:
+                                st.json(parsed)
+                            else:
+                                st.text(msg["result"])
+
+        chat_input = st.chat_input("Ask about your security environment...")
+        pending_msg = st.session_state.pop("chat_pending", None)
+        active_input = pending_msg or chat_input
+
+        if active_input:
+            st.session_state.chat_messages.append({"role": "user", "content": active_input})
+            with chat_container:
+                st.markdown(f'<div class="chat-user"><strong>You:</strong> {html.escape(active_input)}</div>', unsafe_allow_html=True)
+                components.html(_SCROLL_JS, height=0)
+            api_messages = [{"role": "user", "content": active_input}]
+
+            thinking_ph = None
+            try:
+                with chat_container:
+                    thinking_ph = st.empty()
+                    thinking_ph.markdown(
+                        '<div class="chat-assistant" style="color:#9CA3AF;">'
+                        '<strong>Falcon Digest:</strong> Thinking...</div>',
+                        unsafe_allow_html=True
+                    )
+                deadline = time.monotonic() + TURN_TIME_BUDGET_SECONDS
+                response = call_llm(api_messages, TOOL_DEFINITIONS, deadline=deadline)
+                turn_tool_results = []
 
                 max_iterations = 10
                 iteration = 0
@@ -2896,36 +3285,47 @@ with tab_chat:
                             "input": tc["input"], "result": None
                         })
                         result = execute_tool(tc["name"], tc["input"])
+                        turn_tool_results.append(result)
                         st.session_state.chat_messages[-1]["result"] = result
                         tool_results.append({
                             "type": "tool_result", "tool_use_id": tc["id"], "content": result
                         })
                     api_messages.append({"role": "assistant", "content": response["content"]})
                     api_messages.append({"role": "user", "content": tool_results})
-                    response = call_llm(api_messages, TOOL_DEFINITIONS)
+                    response = call_llm(api_messages, TOOL_DEFINITIONS, deadline=deadline)
 
-            # Extract final text outside spinner so overlay is gone during streaming
-            final_text = ""
-            for block in response.get("content", []):
-                if block.get("type") == "text":
-                    final_text += block.get("text", "")
-            if final_text:
-                stream_to_chat(chat_container, final_text)
-                st.session_state.chat_messages.append({"role": "assistant", "content": final_text})
+                thinking_ph.empty()
 
-        except Exception as e:
-            _logger.error("LLM error: %s", e, exc_info=True)
-            err_msg = "Sorry, I'm having trouble connecting to Falcon Digest right now. Please try again in a moment."
-            stream_to_chat(chat_container, err_msg)
-            st.session_state.chat_messages.append({
-                "role": "assistant",
-                "content": err_msg
-            })
+                final_text = ""
+                for block in response.get("content", []):
+                    if block.get("type") == "text":
+                        final_text += block.get("text", "")
+                if final_text:
+                    final_text = validate_response(final_text, turn_tool_results)
+                    stream_to_chat(chat_container, final_text)
+                    st.session_state.chat_messages.append({"role": "assistant", "content": final_text})
 
-    if st.session_state.chat_messages:
-        if st.button("Clear Chat", key="clear_chat"):
+            except Exception as e:
+                _logger.error("LLM error: %s", e, exc_info=True)
+                if thinking_ph:
+                    thinking_ph.empty()
+                if isinstance(e, LLMTimeoutError):
+                    err_msg = (f"That took longer than {TURN_TIME_BUDGET_SECONDS} seconds, so I stopped. "
+                               "Try a narrower question, or a faster model in Settings.")
+                else:
+                    err_msg = "Sorry, I'm having trouble connecting to Falcon Digest right now. Please try again in a moment."
+                stream_to_chat(chat_container, err_msg)
+                st.session_state.chat_messages.append({
+                    "role": "assistant",
+                    "content": err_msg
+                })
+
+        if st.session_state.chat_messages:
+            if st.button("Clear Chat", key="clear_chat"):
                 st.session_state.chat_messages = []
                 st.rerun()
+
+    _chat_fragment()
 
 # ============ FOOTER ============
 

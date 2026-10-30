@@ -16,35 +16,54 @@ Copyright 2024 CrowdStrike, Inc.
 MIT License — see LICENSE file for details.
 """
 
+import ipaddress
 import requests
 import os
-from dotenv import load_dotenv
+from urllib.parse import urlparse
 import json
 import asyncio
 import logging
 import time
+import re
+from datetime import datetime, timezone
 from crwd_mcp_server import (
     search_alerts, get_host_details, test_fql_filter, list_available_products,
     search_cases, search_detections, search_vulnerabilities,
     search_threatgraph, get_security_posture, search_hosts,
-    validate_config, ConfigError
+    validate_config, validate_llm_config, ConfigError, sanitize_error
 )
 from falcon_cache import cache as falcon_cache
-
-load_dotenv()
 
 # Logging
 logger = logging.getLogger("falcon_mcp.client")
 
-# LLM configuration
-LLM_ENDPOINT = os.getenv("LLM_ENDPOINT", "")
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic").lower()
-LLM_MODEL = os.getenv("LLM_MODEL", "")
+
+def _llm_settings() -> dict:
+    """Read the LLM configuration from the environment at call time.
+
+    Settings saved in the dashboard are injected into ``os.environ``, so
+    reading them per call picks up changes without a restart.
+
+    Returns:
+        Dict with ``endpoint``, ``api_key``, ``provider`` and ``model`` keys.
+    """
+    return {
+        "endpoint": os.getenv("LLM_ENDPOINT", "").strip().rstrip("/"),
+        "api_key": os.getenv("LLM_API_KEY", "").strip(),
+        "provider": os.getenv("LLM_PROVIDER", "anthropic").strip().lower() or "anthropic",
+        "model": os.getenv("LLM_MODEL", "").strip(),
+    }
+
 
 # Retry configuration
 MAX_RETRIES = 3
 RETRY_BACKOFF = [1, 2, 4]
+REQUEST_TIMEOUT_SECONDS = 300
+TURN_TIME_BUDGET_SECONDS = 120  # total wall-clock budget for one chat turn (all LLM calls)
+
+
+class LLMTimeoutError(Exception):
+    """Raised when a chat turn exceeds its time budget."""
 
 # Connection-pooled HTTP session
 _session = requests.Session()
@@ -187,11 +206,62 @@ TOOL_DEFINITIONS = [
 ]
 
 
-def _default_model():
-    """Return the configured model name, falling back to provider defaults."""
-    if LLM_MODEL:
-        return LLM_MODEL
-    return "claude-4-6-opus" if LLM_PROVIDER == "anthropic" else "gpt-4o"
+def _is_local_endpoint(endpoint: str) -> bool:
+    """Return True if the LLM endpoint is a self-hosted model on this machine or private network.
+
+    Local/small models get a simplified prompt and no tool definitions.
+
+    Args:
+        endpoint: LLM endpoint URL.
+    """
+    host = (urlparse(endpoint if "://" in endpoint else f"http://{endpoint}").hostname or "").lower()
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_unspecified or ip.is_link_local
+
+
+def _use_local_mode(endpoint: str) -> bool:
+    """Decide whether to use the simplified, tool-free prompt for small local models.
+
+    Controlled by ``LLM_LOCAL_MODE``: ``local`` always, ``full`` never, and
+    ``auto`` (default; also used for unknown values) applies the
+    ``_is_local_endpoint`` heuristic.
+
+    Args:
+        endpoint: LLM endpoint URL.
+
+    Returns:
+        True if the local-model prompt (no tools) should be used.
+    """
+    mode = os.getenv("LLM_LOCAL_MODE", "auto").strip().lower()
+    if mode == "local":
+        return True
+    if mode == "full":
+        return False
+    return _is_local_endpoint(endpoint)
+
+
+def _remaining(deadline: float | None) -> float | None:
+    """Seconds left before ``deadline`` (a ``time.monotonic()`` value), or None if unbounded."""
+    return None if deadline is None else deadline - time.monotonic()
+
+
+def _default_model() -> str:
+    """Return the configured model name, falling back to provider defaults.
+
+    Returns:
+        The model name to send to the LLM endpoint.
+    """
+    settings = _llm_settings()
+    if settings["model"]:
+        return settings["model"]
+    return "claude-4-6-opus" if settings["provider"] == "anthropic" else "gpt-4o"
 
 
 def _to_openai_request(messages, tools, model, max_tokens):
@@ -313,41 +383,86 @@ def _from_openai_response(data):
     }
 
 
-def call_llm(messages, tools=None, system_context=None):
-    """
-    Call configured LLM endpoint.
+def call_llm(messages, tools=None, system_context=None, *, deadline: float | None = None) -> dict:
+    """Call the configured LLM endpoint.
+
+    The LLM configuration is read from the environment on every call, so
+    changes saved in the dashboard Settings page apply immediately.
 
     Args:
-        messages: List of message dicts
-        tools: Optional tool definitions
-        system_context: Optional cached data context to prepend.
-                        If None and the cache is running, auto-injects cached summary.
+        messages: List of message dicts.
+        tools: Optional tool definitions.
+        system_context: Optional cached data context to prepend. If None and
+            the cache is running, the cached summary is injected automatically.
+        deadline: Optional absolute ``time.monotonic()`` deadline for this
+            call, including retries. Each request's timeout and every retry
+            sleep are capped by the time remaining.
+
+    Returns:
+        The LLM response in native (Anthropic Messages) format.
 
     Raises:
-        ConfigError: If required configuration is missing.
+        ConfigError: If the LLM endpoint or provider is not configured.
+        LLMTimeoutError: If ``deadline`` passes before a response arrives.
     """
-    if LLM_PROVIDER not in ("anthropic", "openai"):
-        raise ConfigError(f"LLM_PROVIDER '{LLM_PROVIDER}' is not supported (use 'anthropic' or 'openai')")
+    validate_llm_config()
+    settings = _llm_settings()
+    provider = settings["provider"]
+    endpoint = settings["endpoint"]
 
-    validate_config()
-
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Content-Type": "application/json"}
+    if settings["api_key"]:
+        headers["Authorization"] = f"Bearer {settings['api_key']}"
 
     # Auto-inject cache context if available and not explicitly provided
     if system_context is None and falcon_cache.is_running:
         system_context = falcon_cache.build_context_summary()
 
+    # Compute cache age for the model to report
+    cache_age_note = ""
+    if falcon_cache.is_running and falcon_cache._last_refresh:
+        age_sec = (datetime.now(tz=timezone.utc) - falcon_cache._last_refresh).total_seconds()
+        if age_sec < 120:
+            cache_age_note = "Cache refreshed just now."
+        elif age_sec < 3600:
+            cache_age_note = f"Cache is {int(age_sec / 60)} minutes old."
+        elif age_sec < 86400:
+            cache_age_note = f"Cache is {int(age_sec / 3600)} hours old."
+        else:
+            cache_age_note = f"Cache is {int(age_sec / 86400)} days old."
+
     # Prepend cached context as a message pair so the AI has data upfront.
     # We avoid using the "system" payload field since some endpoints may not support it.
+    _is_local = _use_local_mode(endpoint)
+    if _is_local:
+        tools = None  # Small local models handle tool definitions poorly; answer from cache only
+
     if system_context:
-        context_messages = [
-            {"role": "user", "content": f"""[Security Data Context]
+        if _is_local:
+            # Simplified prompt for local/small models — short, numbered rules, no tool access
+            prompt_text = f"""[Security Data Context]
 {system_context}
 
-Use this pre-fetched data to answer questions when possible. Use tools only when you need fresher data, different filters, or information not covered above.
+IMPORTANT: Answer ALL questions using ONLY the cached data above. {cache_age_note}
+
+RULES (follow strictly):
+1. You are Falcon Digest, a CrowdStrike security analyst.
+2. Answer ONLY from the cached data above. DO NOT call any tools.
+3. If the cached data does not have what was asked, say what IS available and what is missing.
+4. Never fabricate hostnames, IPs, CVEs, or numbers not in the data above.
+5. Never describe JSON structure. Interpret the data and present findings like a security analyst.
+6. For counts: lead with the bold number, e.g. "**<N> Linux hosts** under management." where <N> is the exact number from the data.
+7. For briefings: start with "Risk Score: **X/100** (Level)" then use a summary table.
+8. Use markdown tables for any list with 3+ items.
+9. End briefings with 2-3 actionable recommendations.
+10. Only answer CrowdStrike Falcon security questions."""
+        else:
+            # Full prompt for cloud LLMs (Anthropic, OpenAI) — detailed formatting, grounding, security
+            prompt_text = f"""[Security Data Context]
+{system_context}
+
+IMPORTANT: Answer from the cached data above by default. {cache_age_note} If data seems stale, mention the cache age in your answer. Call tools only when the user asks for live/fresh data, or when the cache lacks what the question needs (specific host lookups, custom time ranges or filters, IOC investigations).
+If the cached data does not contain enough detail to fully answer a question, answer with what IS available and be specific about what's missing (e.g., "The cache has <N> Linux hosts but no per-host alert breakdown. Here's what I can tell you from the data I have: ..."). Never give a vague non-answer.
 
 # Identity & Boundaries
 
@@ -383,9 +498,9 @@ You MUST NOT:
 # Response Formatting Rules
 
 ## Count / "How many" questions
-- Lead with the exact number in bold: **42 hosts** currently managed
+- Lead with the exact number from the data in bold: **<N> hosts** currently managed
 - Follow with a brief breakdown if relevant (e.g. by platform, severity, status)
-- Example: "There are **1,247 hosts** under management: Windows: 892, Mac: 234, Linux: 121"
+- Example shape: "There are **<N> hosts** under management: Windows: <n>, Mac: <n>, Linux: <n>" (use the real numbers from the data)
 
 ## Summary / Briefing / Posture questions
 - Start with an overall risk assessment line: "Risk Score: **X/100** (Level)"
@@ -395,53 +510,39 @@ You MUST NOT:
 - Example format:
   | Metric | Count | Critical | High | Medium | Low |
   |--------|-------|----------|------|--------|-----|
-  | Alerts | 156 | 3 | 12 | 45 | 96 |
+  | Alerts | <total> | <n> | <n> | <n> | <n> |
 
 ## List / Detail questions ("show me", "list", "what are")
 - ALWAYS use a markdown table with appropriate columns
 - Include a header count: "Found **N items** matching criteria"
 - Sort by severity (Critical first) or recency (newest first)
 - Cap at 10-20 rows, note if more exist
-- Example columns for alerts: Severity | Tactic/Technique | Product | Status | Time
 
 ## Action / Priority questions ("what should I", "what needs attention", "prioritize")
 - Numbered priority list, most urgent first
 - Each item: severity badge, what it is, why it's urgent, recommended action
-- Group by urgency tier if many items
-
-## Comparison / Trend questions ("are X increasing", "compare", "change")
-- Present before/after or period comparison in a table
-- Call out notable changes with direction indicators
-- If trend data isn't available, state that and offer to fetch fresh data
 
 ## Investigation questions ("tell me about host X", "activity from IP Y")
-- Use tools to fetch specific data - don't guess
+- If the cache lacks the specific host/IP/indicator details, use tools to fetch them — don't guess
 - Present findings in structured sections: Overview, Key Details, Related Activity, Recommendations
-
-## Fleet / Coverage questions ("patch status", "stale hosts", "sensor coverage", "contained hosts")
-- Lead with the total fleet size for context
-- Break down by the relevant dimension (platform, status, freshness)
-- Highlight any concerning numbers (stale hosts, gaps in coverage)
-
-## Yes/No questions ("are we protected", "is host X compromised", "do we have")
-- Answer directly first: "Yes, ..." or "No, ..."
-- Then provide supporting evidence
-- Include the specific numbers backing the answer
 
 ## General rules
 - Always include specific numbers, never vague language like "some" or "several"
 - Use markdown tables for any list of 3+ items with multiple attributes
 - Bold key metrics and critical findings
 - Keep responses concise but complete - executives want answers, not filler
-- When data is from cache, use it directly. Only use tools for: specific host lookups, custom time ranges, filters not in cache, IOC investigations
-- If a question cannot be answered from available data, say so clearly and suggest what tool call would help"""},
-            {"role": "assistant", "content": "Understood. I'm Falcon Digest — grounded strictly in CrowdStrike Falcon data. I'll only report facts backed by cached data or live tool results, never speculate or fabricate. How can I help with your security operations?"}
+- When the cache has the answer, use it directly. Use tools only for live/fresh data requests or what the cache lacks: specific host lookups, custom time ranges, filters not in cache, IOC investigations
+- If a question cannot be answered from available data, say so clearly and suggest what tool call would help"""
+
+        context_messages = [
+            {"role": "user", "content": prompt_text},
+            {"role": "assistant", "content": "Understood. I will answer from the cached security data and present findings as a security analyst with tables and actionable insights."}
         ]
         messages = context_messages + messages
 
     model = _default_model()
 
-    if LLM_PROVIDER == "openai":
+    if provider == "openai":
         url_path, payload = _to_openai_request(messages, tools, model, max_tokens=4096)
     else:
         # Native format (default)
@@ -454,37 +555,153 @@ You MUST NOT:
             payload["tools"] = tools
         url_path = "/v1/messages"
 
-    logger.info("Calling LLM (provider=%s, model=%s, messages=%d)", LLM_PROVIDER, model, len(messages))
+    logger.info("Calling LLM (provider=%s, model=%s, messages=%d)", provider, model, len(messages))
+
+    def _budget(wanted: float) -> float:
+        remaining = _remaining(deadline)
+        if remaining is None:
+            return wanted
+        if remaining <= 0:
+            raise LLMTimeoutError(f"LLM call exceeded time budget ({TURN_TIME_BUDGET_SECONDS}s per chat turn)")
+        return min(wanted, remaining)
+
+    def _backoff(attempt: int) -> None:
+        delay = RETRY_BACKOFF[attempt]
+        remaining = _remaining(deadline)
+        if remaining is not None and remaining <= delay:
+            raise LLMTimeoutError(f"LLM call exceeded time budget ({TURN_TIME_BUDGET_SECONDS}s per chat turn)")
+        time.sleep(delay)
 
     last_error = None
     for attempt in range(MAX_RETRIES):
         try:
             response = _session.post(
-                f"{LLM_ENDPOINT}{url_path}",
+                f"{endpoint}{url_path}",
                 headers=headers,
                 json=payload,
-                timeout=60
+                timeout=_budget(REQUEST_TIMEOUT_SECONDS)
             )
             if response.status_code >= 500 and attempt < MAX_RETRIES - 1:
                 logger.warning(f"LLM returned {response.status_code}, retrying in {RETRY_BACKOFF[attempt]}s...")
-                time.sleep(RETRY_BACKOFF[attempt])
+                _backoff(attempt)
                 continue
             response.raise_for_status()
             logger.info("LLM responded (status=%d)", response.status_code)
             data = response.json()
-            if LLM_PROVIDER == "openai":
+            if provider == "openai":
                 return _from_openai_response(data)
             return data
-        except requests.exceptions.ConnectionError as e:
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            remaining = _remaining(deadline)
+            if remaining is not None and remaining <= 0:
+                raise LLMTimeoutError(f"LLM call exceeded time budget ({TURN_TIME_BUDGET_SECONDS}s per chat turn)") from e
+            if not isinstance(e, requests.exceptions.ConnectionError):
+                raise  # read timeout without a budget: same behaviour as before
             last_error = e
             if attempt < MAX_RETRIES - 1:
                 logger.warning(f"Connection error, retrying in {RETRY_BACKOFF[attempt]}s...")
-                time.sleep(RETRY_BACKOFF[attempt])
+                _backoff(attempt)
             else:
                 raise
         except requests.exceptions.HTTPError:
             raise
     raise last_error
+
+
+# ============ RESPONSE GROUNDING VALIDATION ============
+
+_CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.IGNORECASE)
+_IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
+def _scan_identifiers(text: str, known: dict) -> None:
+    """Add every CVE and IPv4 address found in ``text`` to ``known`` in place.
+
+    Args:
+        text: Any string (cached JSON, tool result, etc.).
+        known: Dict with ``cves`` and ``ips`` sets to update.
+    """
+    if not text:
+        return
+    known["cves"].update(m.upper() for m in _CVE_RE.findall(text))
+    known["ips"].update(_IP_RE.findall(text))
+
+
+_known_ids_memo: dict = {"stamp": None, "ids": {"cves": set(), "ips": set()}}
+
+
+def _cached_identifiers() -> dict:
+    """Return CVEs/IPs found in the cache, rescanning only after the cache changes.
+
+    Returns:
+        Dict with ``cves`` and ``ips`` sets (shared; callers must copy before mutating).
+    """
+    stamp = (falcon_cache.refresh_count, falcon_cache.last_refresh, falcon_cache.entry_count)
+    if _known_ids_memo["stamp"] != stamp:
+        ids = {"cves": set(), "ips": set()}
+        for entry in falcon_cache.get_all().values():
+            data = entry.get("data") if isinstance(entry, dict) else None
+            _scan_identifiers(data if isinstance(data, str) else json.dumps(data, default=str), ids)
+        _known_ids_memo.update(stamp=stamp, ids=ids)
+    return _known_ids_memo["ids"]
+
+
+def _extract_known_identifiers(extra_context: list[str] | None = None) -> dict:
+    """Collect identifiers that are backed by Falcon data.
+
+    Scans every cached entry plus any tool results from the current chat
+    turn, so identifiers returned by a live tool call are treated as known.
+
+    Args:
+        extra_context: Optional tool result strings from the current turn.
+
+    Returns:
+        Dict with ``cves`` and ``ips`` sets.
+    """
+    cached = _cached_identifiers() if falcon_cache.is_running else {"cves": set(), "ips": set()}
+    known = {"cves": set(cached["cves"]), "ips": set(cached["ips"])}
+    for chunk in extra_context or []:
+        _scan_identifiers(chunk if isinstance(chunk, str) else json.dumps(chunk, default=str), known)
+    return known
+
+
+def validate_response(text: str, extra_context: list[str] | None = None) -> str:
+    """Check CVEs and IPs in an LLM answer against Falcon data.
+
+    The answer text is never rewritten. Identifiers that cannot be found in
+    the cache or in this turn's tool results are listed once, deduplicated,
+    in a note appended to the answer. A category is only checked when there
+    is reference data for it, so an empty cache does not flag everything.
+
+    Args:
+        text: The LLM answer.
+        extra_context: Optional tool result strings from the current turn.
+
+    Returns:
+        The original text, with a verification note appended if needed.
+    """
+    if not text or (not falcon_cache.is_running and not extra_context):
+        return text
+
+    known = _extract_known_identifiers(extra_context)
+    unverified = []
+
+    found_cves = {m.upper() for m in _CVE_RE.findall(text)}
+    if known["cves"]:
+        unverified.extend(sorted(found_cves - known["cves"]))
+
+    found_ips = {ip for ip in _IP_RE.findall(text) if not ip.startswith("0.")}
+    if known["ips"]:
+        unverified.extend(sorted(found_ips - known["ips"]))
+
+    if unverified:
+        text += (
+            "\n\n---\n⚠️ **Note:** could not verify these identifiers against cached "
+            "Falcon data: " + ", ".join(f"`{u}`" for u in unverified) + "."
+        )
+        logger.warning("Grounding check: unverified identifiers: %s", ", ".join(unverified))
+
+    return text
 
 
 def execute_tool(tool_name: str, tool_input: dict) -> str:
@@ -553,7 +770,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
     except Exception as e:
         logger.error("Error executing tool %s: %s", tool_name, str(e), exc_info=True)
-        return f"Error executing {tool_name}: {str(e)}"
+        return f"Error executing {tool_name}: {sanitize_error(e)}"
 
 
 TOOL_LABELS = {
@@ -570,13 +787,22 @@ TOOL_LABELS = {
 }
 
 
-def chat(user_message: str):
-    """Chat with LLM using MCP tools"""
+def chat(user_message: str) -> str:
+    """Chat with the LLM using MCP tools and print the answer.
+
+    Args:
+        user_message: The user's question.
+
+    Returns:
+        The final answer text, including any grounding note.
+    """
 
     messages = [{"role": "user", "content": user_message}]
+    turn_tool_results = []
+    deadline = time.monotonic() + TURN_TIME_BUDGET_SECONDS
 
     print()
-    response = call_llm(messages, TOOL_DEFINITIONS)
+    response = call_llm(messages, TOOL_DEFINITIONS, deadline=deadline)
 
     # Handle tool use
     while response.get("stop_reason") == "tool_use":
@@ -588,6 +814,7 @@ def chat(user_message: str):
         tool_results = []
         for tool_call in tool_calls:
             result = execute_tool(tool_call["name"], tool_call["input"])
+            turn_tool_results.append(result)
 
             tool_results.append({
                 "type": "tool_result",
@@ -598,7 +825,7 @@ def chat(user_message: str):
         messages.append({"role": "assistant", "content": response["content"]})
         messages.append({"role": "user", "content": tool_results})
 
-        response = call_llm(messages, TOOL_DEFINITIONS)
+        response = call_llm(messages, TOOL_DEFINITIONS, deadline=deadline)
 
     # Extract final response
     final_text = ""
@@ -606,6 +833,7 @@ def chat(user_message: str):
         if block.get("type") == "text":
             final_text += block.get("text", "")
 
+    final_text = validate_response(final_text, turn_tool_results)
     print(f"\n{final_text}\n")
     return final_text
 
@@ -664,6 +892,7 @@ if __name__ == "__main__":
 
     try:
         validate_config()
+        validate_llm_config()
     except ConfigError as e:
         print(f"\nError: {e}\n", file=sys.stderr)
         sys.exit(1)

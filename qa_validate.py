@@ -233,68 +233,71 @@ check("Docstring says 13 tools", "13 tools" in src)
 # ============================================================
 print("\n--- 7. DASHBOARD V2 STRUCTURE CHECK ---")
 
-with open("mcp_dashboard_v2.py", "r") as f:
-    v2 = f.read()
-
-check("V2 imports get_identity_protection", "get_identity_protection" in v2)
-check("V2 imports get_cloud_security", "get_cloud_security" in v2)
-check("V2 imports get_exposure_management", "get_exposure_management" in v2)
-
-# Tab variable names
-check("V2 has tab_identity variable", "tab_identity" in v2)
-check("V2 has tab_cloud variable", "tab_cloud" in v2)
-check("V2 has tab_exposure variable", "tab_exposure" in v2)
-
-# Tab labels in st.tabs
-check("V2 tab label 'Identity'", '"Identity"' in v2)
-check("V2 tab label 'Cloud Security'", '"Cloud Security"' in v2)
-check("V2 tab label 'Exposure'", '"Exposure"' in v2)
-
-# Tab order: Identity, Cloud Security, Exposure come after Vulnerabilities and before IOC Search
-import re
-tabs_match = re.search(r'st\.tabs\(\[(.*?)\]\)', v2, re.DOTALL)
-if tabs_match:
-    tabs_str = tabs_match.group(1)
-    tab_labels = [t.strip().strip('"').strip("'") for t in tabs_str.split(",")]
-    tab_labels = [t for t in tab_labels if t]
-    print(f"         V2 tab order: {' | '.join(tab_labels)}")
-
-    expected = ["Executive Summary", "Detections", "Cases", "Vulnerabilities",
-                "Identity", "Cloud Security", "Exposure",
-                "IOC Search", "Data Ingestion", "FQL Tools"]
-    check("V2 has 10 tabs", len(tab_labels) == 10, f"got {len(tab_labels)}: {tab_labels}")
-    check("V2 tab order correct", tab_labels == expected, f"got {tab_labels}")
+if not os.path.exists("mcp_dashboard_v2.py"):
+    print("  SKIP: mcp_dashboard_v2.py not present (local-only file, not in the repo)")
 else:
-    check("V2 st.tabs() found", False, "Could not parse st.tabs")
+    with open("mcp_dashboard_v2.py", "r") as f:
+        v2 = f.read()
 
-# Tab content blocks
-check("V2 'with tab_identity:' block", "with tab_identity:" in v2)
-check("V2 'with tab_cloud:' block", "with tab_cloud:" in v2)
-check("V2 'with tab_exposure:' block", "with tab_exposure:" in v2)
+    check("V2 imports get_identity_protection", "get_identity_protection" in v2)
+    check("V2 imports get_cloud_security", "get_cloud_security" in v2)
+    check("V2 imports get_exposure_management", "get_exposure_management" in v2)
 
-# Session state keys
-check("V2 session 'identity_data'", '"identity_data"' in v2)
-check("V2 session 'cloud_security_data'", '"cloud_security_data"' in v2)
-check("V2 session 'exposure_data'", '"exposure_data"' in v2)
+    # Tab variable names
+    check("V2 has tab_identity variable", "tab_identity" in v2)
+    check("V2 has tab_cloud variable", "tab_cloud" in v2)
+    check("V2 has tab_exposure variable", "tab_exposure" in v2)
 
-# CID change clears new keys
-check("V2 CID-change clears identity_data", "identity_data" in v2.split("check_cid_change")[1][:500])
-check("V2 CID-change clears cloud_security_data", "cloud_security_data" in v2.split("check_cid_change")[1][:500])
-check("V2 CID-change clears exposure_data", "exposure_data" in v2.split("check_cid_change")[1][:500])
+    # Tab labels in st.tabs
+    check("V2 tab label 'Identity'", '"Identity"' in v2)
+    check("V2 tab label 'Cloud Security'", '"Cloud Security"' in v2)
+    check("V2 tab label 'Exposure'", '"Exposure"' in v2)
 
-# FALCON_LINKS
-check("V2 FALCON_LINKS has 'identity'", '"identity"' in v2.split("FALCON_LINKS")[1][:500])
-check("V2 FALCON_LINKS has 'cloud_security'", '"cloud_security"' in v2.split("FALCON_LINKS")[1][:500])
-check("V2 FALCON_LINKS has 'exposure'", '"exposure"' in v2.split("FALCON_LINKS")[1][:500])
+    # Tab order: Identity, Cloud Security, Exposure come after Vulnerabilities and before IOC Search
+    import re
+    tabs_match = re.search(r'st\.tabs\(\[(.*?)\]\)', v2, re.DOTALL)
+    if tabs_match:
+        tabs_str = tabs_match.group(1)
+        tab_labels = [t.strip().strip('"').strip("'") for t in tabs_str.split(",")]
+        tab_labels = [t for t in tab_labels if t]
+        print(f"         V2 tab order: {' | '.join(tab_labels)}")
 
-# Chart types present
-# Chart types: just check they exist in new tab blocks
-check("V2 has Pie chart in new tabs", v2.count("go.Pie(") >= 2)  # at least 2 new pies (status + providers)
-check("V2 has Bar chart in new tabs", v2.count("go.Bar(") >= 4)  # at least 4 new bars
+        expected = ["Executive Summary", "Detections", "Cases", "Vulnerabilities",
+                    "Identity", "Cloud Security", "Exposure",
+                    "IOC Search", "Data Ingestion", "FQL Tools"]
+        check("V2 has 10 tabs", len(tab_labels) == 10, f"got {len(tab_labels)}: {tab_labels}")
+        check("V2 tab order correct", tab_labels == expected, f"got {tab_labels}")
+    else:
+        check("V2 st.tabs() found", False, "Could not parse st.tabs")
 
-# Tab section numbering
-for i, name in [(5, "IDENTITY"), (6, "CLOUD SECURITY"), (7, "EXPOSURE"), (8, "IOC SEARCH"), (9, "DATA INGESTION"), (10, "FQL TOOLS")]:
-    check(f"V2 TAB {i} comment: {name}", f"TAB {i}: {name}" in v2)
+    # Tab content blocks
+    check("V2 'with tab_identity:' block", "with tab_identity:" in v2)
+    check("V2 'with tab_cloud:' block", "with tab_cloud:" in v2)
+    check("V2 'with tab_exposure:' block", "with tab_exposure:" in v2)
+
+    # Session state keys
+    check("V2 session 'identity_data'", '"identity_data"' in v2)
+    check("V2 session 'cloud_security_data'", '"cloud_security_data"' in v2)
+    check("V2 session 'exposure_data'", '"exposure_data"' in v2)
+
+    # CID change clears new keys
+    check("V2 CID-change clears identity_data", "identity_data" in v2.split("check_cid_change")[1][:500])
+    check("V2 CID-change clears cloud_security_data", "cloud_security_data" in v2.split("check_cid_change")[1][:500])
+    check("V2 CID-change clears exposure_data", "exposure_data" in v2.split("check_cid_change")[1][:500])
+
+    # FALCON_LINKS
+    check("V2 FALCON_LINKS has 'identity'", '"identity"' in v2.split("FALCON_LINKS")[1][:500])
+    check("V2 FALCON_LINKS has 'cloud_security'", '"cloud_security"' in v2.split("FALCON_LINKS")[1][:500])
+    check("V2 FALCON_LINKS has 'exposure'", '"exposure"' in v2.split("FALCON_LINKS")[1][:500])
+
+    # Chart types present
+    # Chart types: just check they exist in new tab blocks
+    check("V2 has Pie chart in new tabs", v2.count("go.Pie(") >= 2)  # at least 2 new pies (status + providers)
+    check("V2 has Bar chart in new tabs", v2.count("go.Bar(") >= 4)  # at least 4 new bars
+
+    # Tab section numbering
+    for i, name in [(5, "IDENTITY"), (6, "CLOUD SECURITY"), (7, "EXPOSURE"), (8, "IOC SEARCH"), (9, "DATA INGESTION"), (10, "FQL TOOLS")]:
+        check(f"V2 TAB {i} comment: {name}", f"TAB {i}: {name}" in v2)
 
 # ============================================================
 # 8. DASHBOARD V1 STRUCTURE CHECK
