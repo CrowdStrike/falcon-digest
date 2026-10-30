@@ -61,8 +61,9 @@ if [ -f ".env" ]; then
     echo ""
     echo "  Found an existing .env — on first dashboard start its Falcon/LLM"
     echo "  values are imported into the encrypted config and the file is"
-    echo "  renamed to .env.migrated. Delete .env.migrated once the dashboard"
-    echo "  works, because it still contains your plaintext secret."
+    echo "  moved to ~/.falcon-digest/.env.migrated (or \$FALCON_DIGEST_HOME)."
+    echo "  Delete it once the dashboard works, because it still contains your"
+    echo "  plaintext secret."
 fi
 
 # ------ 5. Run tests (optional) ------
@@ -99,7 +100,7 @@ echo "  streamlit run mcp_dashboard.py"
 echo ""
 echo "  # First launch:"
 echo "  #   1. Copy the one-time setup token printed in this terminal"
-echo "  #      (also stored in .falcon_users.json.setup)"
+echo "  #      (also stored in ~/.falcon-digest/.falcon_users.json.setup)"
 echo "  #   2. Create the admin account in the browser using that token"
 echo "  #   3. Enter Falcon API credentials (and optionally LLM settings) in Settings"
 echo ""

@@ -63,7 +63,7 @@ streamlit run mcp_dashboard.py
 
 # On first launch:
 # 1. Copy the one-time setup token printed in this terminal
-#    (also stored in .falcon_users.json.setup)
+#    (also stored in ~/.falcon-digest/.falcon_users.json.setup)
 # 2. Create the admin account in the browser using that token
 # 3. Enter Falcon API credentials in the Settings page
 # 4. Optionally configure LLM settings for AI chat
@@ -154,14 +154,14 @@ Run the AI chat features entirely offline using [Ollama](https://ollama.com) —
 
 - **Read-Only Access** — All Falcon API operations are strictly read-only. No RTR, no response actions, no write operations.
 - **Mandatory Authentication** — All dashboard access requires login. Passwords are hashed with PBKDF2-SHA256 (600k iterations, per-user salt) and stored in `.falcon_users.json`. Usernames are case-insensitive, and repeated failed logins trigger a temporary lockout with backoff, counted per client address. When Streamlit can't see the client IP (localhost, or behind a reverse proxy) the lockout is per browser session, plus a per-username slow-down that never hard-blocks the account. If you put the dashboard behind a reverse proxy, per-IP lockout depends on the proxy passing client addresses.
-- **Protected First-Run Setup** — Creating the first admin requires a one-time setup token, printed to the terminal running `streamlit run` and stored in `.falcon_users.json.setup` (0600). The token is deleted after use. If `.falcon_users.json` exists but is corrupt or unreadable, the dashboard refuses to start instead of reopening setup.
+- **Protected First-Run Setup** — Creating the first admin requires a one-time setup token, printed to the terminal running `streamlit run` and stored in `~/.falcon-digest/.falcon_users.json.setup` (0600, or under `$FALCON_DIGEST_HOME`). The token is deleted after use. If `.falcon_users.json` exists but is corrupt or unreadable, the dashboard refuses to start instead of reopening setup.
 - **Roles** — Only admins can open Settings, manage users, and switch CID profiles; viewers can only view. Roles are re-checked on every page load and inside interactive panels and callbacks (including AI chat), so removing or demoting a user takes effect immediately.
 - **Sessions** — Changing a user's password or role, or removing the user, ends that user's existing sessions. Sessions expire after 8 hours of inactivity. Logout clears all session data, so the next user in the same browser sees nothing from the previous one.
 - **Secrets Stay Server-Side** — Stored secrets (Falcon client secret, LLM API key) are never sent back to the browser. Leave a secret field blank in Settings to keep the existing value.
 - **Encrypted Configuration** — Credentials are stored in `.falcon_config.enc`, encrypted with Fernet (AES-128-CBC + HMAC-SHA256). The encryption key is kept in the OS keychain (service `falcon-digest`, via the `keyring` library) when available, under an account name derived from the data directory path, so separate installs and `FALCON_DIGEST_HOME` directories never share or overwrite each other's key. If `.falcon_config.key` exists in the data directory it is used in preference to the keychain. Otherwise the key is written to `.falcon_config.key` (0600) **next to the ciphertext** — in that mode the encryption only guards against casual disclosure (e.g. backups or syncs of just the config file), not against someone who can read the app directory as the same OS user.
 - **Fail Closed on Decrypt Errors** — If the config file exists but can't be decrypted (for example, a process that can't reach the keychain, or a lost key), the app shows an error and refuses to overwrite it rather than silently resetting your settings.
 - **Encrypted Cache** — `.falcon_cache.json` is encrypted with the same key. If encryption fails, the cache is not written to disk. A plaintext cache left by an older version is re-encrypted on first load, and cache backups in `.falcon_cache_backups/` (made when the CID changes) are encrypted and pruned to the newest 5.
-- **Localhost by Default** — `.streamlit/config.toml` binds the dashboard to `127.0.0.1`.
+- **Localhost by Default** — `.streamlit/config.toml` binds the dashboard to `127.0.0.1`. Streamlit reads this file from the current directory, so start `streamlit run` from the repo root (or pass `--server.address 127.0.0.1`); started elsewhere, it listens on all interfaces.
 - **FQL Injection Prevention** — All user-supplied values are sanitized through a character whitelist (`sanitize_fql_value()`) before interpolation into FQL filter strings.
 - **XSS Protection** — API-sourced values rendered via `unsafe_allow_html=True` are escaped with `html.escape()`.
 - **Error Sanitization** — API error messages are stripped of internal file paths and truncated before display to prevent information leakage.
@@ -267,7 +267,9 @@ Local state (`.env*`, `.falcon_*` config/key/users/cache files) is gitignored. T
 git config core.hooksPath scripts/git-hooks
 ```
 
-Run the same check manually with `python scripts/check_sensitive.py --staged` or `--range origin/main..HEAD`.
+Run the same check manually with `python scripts/check_sensitive.py --staged` or `--range origin/main..HEAD`. Hits show only a label and length, never the value. To check your real config values the hook decrypts the local config, which may need keychain access; set `FALCON_DIGEST_HOOK_SKIP_CONFIG=1` to skip that part.
+
+The tests never read or move a `.env` or state files in your checkout: under pytest, legacy files are only looked up in the temporary data directory.
 
 ## License
 

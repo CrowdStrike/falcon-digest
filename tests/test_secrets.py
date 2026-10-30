@@ -15,6 +15,7 @@ Copyright 2024 CrowdStrike, Inc.
 MIT License — see LICENSE file for details.
 """
 
+import errno
 import os
 import stat
 import sys
@@ -129,7 +130,7 @@ class TestLLMConfig:
         store.save_llm_config("https://api.anthropic.com", "", "anthropic", "m")
         assert store.get_llm_config(include_secret=True)["LLM_API_KEY"] == ""
         assert store.get_llm_config()["LLM_API_KEY_SET"] is False
-        assert store.has_llm_config() is True
+        assert store.get_llm_config()["LLM_ENDPOINT"] == "https://api.anthropic.com"
 
 
 class TestInjectToEnv:
@@ -157,6 +158,30 @@ class TestInjectToEnv:
         ConfigStore(path=cfg_path).inject_to_env()
         assert os.environ["FALCON_CLIENT_ID"] == "from-ide-env"
         assert os.environ["LLM_API_KEY"] == "from-ide-env"
+
+    def test_saving_llm_keeps_falcon_env_credentials(self, cfg_path, monkeypatch):
+        start = {"FALCON_CLIENT_ID": "from-ide-env", "FALCON_CLIENT_SECRET": "ide-secret"}
+        monkeypatch.setattr(falcon_secrets, "_ENV_AT_START", start)
+        for k, v in start.items():
+            monkeypatch.setenv(k, v)
+        store = ConfigStore(path=cfg_path)
+        store.save_llm_config("http://localhost:11434", "", "openai", "")
+        store.inject_to_env()
+        assert os.environ["FALCON_CLIENT_ID"] == "from-ide-env"
+        assert os.environ["FALCON_CLIENT_SECRET"] == "ide-secret"
+        assert os.environ["LLM_ENDPOINT"] == "http://localhost:11434"
+        monkeypatch.delenv("LLM_ENDPOINT")
+        monkeypatch.delenv("LLM_PROVIDER")
+
+    def test_deleting_last_profile_clears_falcon_env(self, cfg_path, monkeypatch):
+        monkeypatch.setattr(falcon_secrets, "_ENV_AT_START", {})
+        store = ConfigStore(path=cfg_path)
+        store.save_profile("prod", "cid-1", SECRET, "https://api.crowdstrike.com")
+        store.inject_to_env()
+        store.delete_profile("prod")
+        store.inject_to_env()
+        assert "FALCON_CLIENT_ID" not in os.environ
+        assert "FALCON_CLIENT_SECRET" not in os.environ
 
 
 class TestDecryptFailure:
@@ -246,6 +271,35 @@ class TestMigration:
         assert store.migrate_from_env(env) is False
         assert open(env).read() == text
         assert not os.path.exists(cfg_path)
+
+    def _exdev_for(self, monkeypatch, path):
+        real_replace = os.replace
+
+        def replace(src, dst):
+            if os.fspath(src) == path:
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return real_replace(src, dst)
+        monkeypatch.setattr(falcon_secrets.os, "replace", replace)
+
+    def test_cross_filesystem_move(self, tmp_path, cfg_path, monkeypatch):
+        env = self._write_env(tmp_path, f"FALCON_CLIENT_ID={DUMMY_CID}\nFALCON_CLIENT_SECRET={SECRET}\n")
+        self._exdev_for(monkeypatch, env)
+        store = ConfigStore(path=cfg_path)
+        assert store.migrate_from_env(env) is True
+        migrated = os.path.join(os.path.dirname(cfg_path), ".env.migrated")
+        assert not os.path.exists(env)
+        assert _mode(migrated) == 0o600
+        assert SECRET in open(migrated).read()
+
+    def test_unmovable_env_still_counts_as_imported(self, tmp_path, cfg_path, monkeypatch, caplog):
+        env = self._write_env(tmp_path, f"FALCON_CLIENT_ID={DUMMY_CID}\nFALCON_CLIENT_SECRET={SECRET}\n")
+        self._exdev_for(monkeypatch, env)
+        monkeypatch.setattr(falcon_secrets.os, "unlink", lambda p: (_ for _ in ()).throw(PermissionError(p)))
+        store = ConfigStore(path=cfg_path)
+        assert store.migrate_from_env(env) is True
+        assert ConfigStore(path=cfg_path).list_profiles()[0]["client_id"] == DUMMY_CID
+        assert "delete it by hand" in caplog.text
+        assert SECRET not in caplog.text
 
     def test_noop_when_config_exists(self, tmp_path, cfg_path):
         store = ConfigStore(path=cfg_path)

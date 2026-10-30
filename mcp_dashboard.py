@@ -160,7 +160,7 @@ if not _user_mgr.has_users():
         '<h2 style="color:#EC0000;">Falcon Digest — Initial Setup</h2>'
         '<p style="color:#6B7280;">Create an admin account to get started. The setup token '
         'is printed in the terminal running <code>streamlit run</code> and stored in '
-        '<code>.falcon_users.json.setup</code>.</p></div>',
+        '<code>.falcon_users.json.setup</code> in the data directory (<code>~/.falcon-digest</code> by default).</p></div>',
         unsafe_allow_html=True
     )
     with st.form("setup_form"):
@@ -569,10 +569,7 @@ st.markdown("""
 # Detect CID change — clear all session state and cache if credentials switched
 if falcon_cache.check_cid_change():
     _logger.info("CID change detected — clearing session state")
-    for key in ["posture_data", "detections_data", "cases_data", "vulns_data",
-                 "tg_edge_types", "ingestion_data", "identity_data",
-                 "cloud_security_data", "exposure_data", "cache_started",
-                 "_cache_sync_count"]:
+    for key in _SESSION_DATA_KEYS + ["cache_started"]:
         st.session_state.pop(key, None)
 
 if "cache_started" not in st.session_state:

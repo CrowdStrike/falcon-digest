@@ -22,7 +22,10 @@ Checks, for staged changes (``--staged``) or a commit range (``--range A..B``):
 3. The real values configured on THIS machine — Falcon client IDs/secrets,
    CID profile names, LLM API keys, dashboard usernames — read from the local
    .env / .env.migrated, the encrypted config store and the users file.
-   Values are never printed; hits are shown masked.
+   Values are never printed; a hit shows only its label and length.
+
+Reading the encrypted config may need the OS keychain. Set
+FALCON_DIGEST_HOOK_SKIP_CONFIG=1 to skip it (the other checks still run).
 
 Install as git hooks with:  git config core.hooksPath scripts/git-hooks
 """
@@ -77,11 +80,8 @@ def _local_values() -> dict:
     """Collect real values configured on this machine (never printed)."""
     needles: dict[str, str] = {}
     env_line = re.compile(r"^#?\s*([A-Z_]+)\s*=\s*(.*)$")
-    try:
-        sys.path.insert(0, REPO)
-        from falcon_secrets import APP_DIR as data_dir
-    except Exception:
-        data_dir = os.path.expanduser(os.environ.get("FALCON_DIGEST_HOME") or "~/.falcon-digest")
+    # Same rule as falcon_secrets.APP_DIR, computed here so a missing data dir is never created
+    data_dir = os.path.abspath(os.path.expanduser(os.environ.get("FALCON_DIGEST_HOME") or "~/.falcon-digest"))
     for path in (os.path.join(REPO, ".env"), os.path.join(REPO, ".env.migrated"), os.path.join(data_dir, ".env.migrated")):
         name = os.path.basename(path)
         if not os.path.isfile(path):
@@ -93,11 +93,14 @@ def _local_values() -> dict:
             elif line.strip().startswith("#") and "=" not in line:
                 _add(needles, line.strip().lstrip("#").strip(), f"{name}:profile name", 5)
 
-    # Encrypted config store (profile names, client IDs, secrets, LLM key/endpoint)
+    # Encrypted config store (profile names, client IDs, secrets, LLM key/endpoint).
+    # Importing falcon_secrets only reads: legacy files are moved by the app, not on import.
+    config_file = os.path.join(data_dir, ".falcon_config.enc")
     try:
-        from falcon_secrets import ConfigStore, CONFIG_FILE
-        if os.path.isfile(CONFIG_FILE):
-            store = ConfigStore(CONFIG_FILE)
+        if os.path.isfile(config_file) and os.environ.get("FALCON_DIGEST_HOOK_SKIP_CONFIG") != "1":
+            sys.path.insert(0, REPO)
+            from falcon_secrets import ConfigStore
+            store = ConfigStore(config_file)
             for p in store.list_profiles():
                 _add(needles, p["name"], "config:profile name", 5)
                 _add(needles, p["client_id"], "config:client id", 8)
@@ -121,7 +124,7 @@ def _local_values() -> dict:
 
 
 def _mask(value: str) -> str:
-    return value[:2] + "…" + value[-2:] if len(value) > 6 else "…"
+    return f"{len(value)} chars"
 
 
 def _changes(args) -> list[tuple[str, str]]:

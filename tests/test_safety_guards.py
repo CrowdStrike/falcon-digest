@@ -16,6 +16,7 @@ MIT License — see LICENSE file for details.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -37,8 +38,9 @@ class TestDataDirLocation:
     def test_tests_run_in_temp_data_dir(self):
         assert falcon_secrets._is_within(falcon_secrets.APP_DIR, tempfile.gettempdir())
 
-    def test_legacy_env_is_read_from_source_dir(self):
-        assert falcon_secrets.LEGACY_ENV_FILE == os.path.join(REPO, ".env")
+    def test_legacy_files_are_not_looked_up_in_checkout_during_tests(self):
+        assert falcon_secrets.LEGACY_DIR == falcon_secrets.APP_DIR
+        assert falcon_secrets._is_within(falcon_secrets.LEGACY_ENV_FILE, tempfile.gettempdir())
 
 
 class TestUnsafeTestRunRefused:
@@ -94,7 +96,7 @@ class TestLegacyStateMove:
         (src / ".falcon_cache.json").write_text("old-cache")
         (src / "mcp_dashboard.py").write_text("code")
         (dst / ".falcon_cache.json").write_text("current-cache")
-        monkeypatch.setattr(falcon_secrets, "SOURCE_DIR", str(src))
+        monkeypatch.setattr(falcon_secrets, "LEGACY_DIR", str(src))
         monkeypatch.setattr(falcon_secrets, "APP_DIR", str(dst))
         falcon_secrets._move_legacy_state()
         assert (dst / ".falcon_users.json").read_text() == "old-users"
@@ -112,3 +114,58 @@ class TestLegacyStateMove:
         assert store.migrate_from_env(str(env)) is True
         assert not env.exists() and not (src / ".env.migrated").exists()
         assert (dst / ".env.migrated").exists()
+
+
+# Files a contributor may have in their checkout from older versions
+DUMMY_ENV = f"FALCON_CLIENT_ID={'dummyclientid' + '0' * 20}\nFALCON_CLIENT_SECRET={'dummysecret' + '0' * 29}\n"
+SENTINELS = {".env": DUMMY_ENV, ".falcon_cache.json": "sentinel-cache", ".falcon_users.json": "sentinel-users"}
+
+
+def _checkout_copy(root) -> str:
+    """Copy the modules that touch legacy files into a fake checkout holding sentinel files."""
+    src = root / "checkout"
+    (src / "tests").mkdir(parents=True)
+    for name in ("falcon_secrets.py", "crwd_mcp_server.py"):
+        shutil.copy(os.path.join(REPO, name), src / name)
+    shutil.copy(os.path.join(REPO, "tests", "conftest.py"), src / "tests" / "conftest.py")
+    for name, text in SENTINELS.items():
+        (src / name).write_text(text)
+    return str(src)
+
+
+def _sentinels_intact(src: str) -> bool:
+    return all(os.path.isfile(os.path.join(src, n)) and open(os.path.join(src, n)).read() == t
+               for n, t in SENTINELS.items())
+
+
+class TestCheckoutUntouched:
+
+    def test_pytest_run_leaves_env_and_state_in_checkout(self, tmp_path):
+        src = _checkout_copy(tmp_path)
+        with open(os.path.join(src, "tests", "test_probe.py"), "w") as f:
+            f.write("import os, sys\nsys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))\n"
+                    "import crwd_mcp_server, falcon_secrets\n\n\n"
+                    "def test_probe():\n    falcon_secrets.load_config_into_env()\n")
+        proc = subprocess.run([sys.executable, "-I", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"],
+                              cwd=src, env={**os.environ, "PYTHON_KEYRING_BACKEND": "keyring.backends.fail.Keyring"},
+                              capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert _sentinels_intact(src)
+
+    def test_app_migrates_on_start_but_import_alone_moves_nothing(self, tmp_path):
+        src, home = _checkout_copy(tmp_path), tmp_path / "home"
+        code = ("import os, sys; sys.path.insert(0, os.getcwd()); import falcon_secrets as f\n"
+                "print(f.LEGACY_ENV_FILE)\n"
+                "print(all(os.path.exists(n) for n in ('.env', '.falcon_cache.json', '.falcon_users.json')))\n"
+                "f.load_config_into_env()\n")
+        env = {k: v for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"}  # run as the app, not a test
+        env.update(FALCON_DIGEST_HOME=str(home), PYTHON_KEYRING_BACKEND="keyring.backends.fail.Keyring")
+        proc = subprocess.run([sys.executable, "-I", "-c", code], cwd=src, env=env,
+                              capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, proc.stderr
+        legacy_env, untouched_after_import = proc.stdout.split()
+        assert legacy_env == os.path.join(src, ".env")
+        assert untouched_after_import == "True"
+        assert not any(os.path.exists(os.path.join(src, n)) for n in SENTINELS)
+        assert (home / ".falcon_cache.json").read_text() == "sentinel-cache"
+        assert (home / ".env.migrated").exists() and (home / ".falcon_config.enc").exists()

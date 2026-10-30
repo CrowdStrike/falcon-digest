@@ -17,6 +17,7 @@ MIT License — see LICENSE file for details.
 
 import base64
 import contextlib
+import errno
 import json
 import logging
 import os
@@ -56,6 +57,11 @@ def _is_within(path: str, parent: str) -> bool:
     return path == parent or path.startswith(parent.rstrip(os.sep) + os.sep)
 
 
+def _under_pytest() -> bool:
+    import sys
+    return "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ
+
+
 def _refuse_unsafe_test_run() -> None:
     """Fail closed if test code is loaded while the data dir is not a temp dir.
 
@@ -63,8 +69,7 @@ def _refuse_unsafe_test_run() -> None:
     modules are imported any other way (e.g. ``python -c "import test_x"``),
     that never happens and the real data dir would be used — refuse instead.
     """
-    import sys
-    if "pytest" not in sys.modules and "PYTEST_CURRENT_TEST" not in os.environ:
+    if not _under_pytest():
         return
     import tempfile
     if not _is_within(APP_DIR, tempfile.gettempdir()):
@@ -80,7 +85,11 @@ KEYRING_SERVICE = "falcon-digest"
 # One keychain entry per data directory, so separate installs/FALCON_DIGEST_HOMEs never share a key
 KEYRING_ACCOUNT = "encryption-key:" + __import__("hashlib").sha256(os.path.realpath(APP_DIR).encode()).hexdigest()[:16]
 CONFIG_FILE = os.path.join(APP_DIR, ".falcon_config.enc")
-LEGACY_ENV_FILE = os.path.join(SOURCE_DIR, ".env")
+# Where older versions kept .env and state files: the source tree. Under tests
+# it is the temp data dir instead, so a test run never moves or migrates a
+# contributor's real .env or state files out of their checkout.
+LEGACY_DIR = APP_DIR if _under_pytest() else SOURCE_DIR
+LEGACY_ENV_FILE = os.path.join(LEGACY_DIR, ".env")
 _KEY_FILE = os.path.join(APP_DIR, ".falcon_config.key")
 _KEY_LOCK_FILE = os.path.join(APP_DIR, ".falcon_config.lock")
 
@@ -198,7 +207,7 @@ def _read_existing_key() -> bytes | None:
 def _get_or_create_key() -> bytes:
     """Return the master encryption key, creating it on first use.
 
-    Looks in the OS keychain first, then the key file. A new key is only
+    Uses the key file if one exists, else the OS keychain. A new key is only
     generated when the key store was read successfully, holds no key, and no
     encrypted config exists yet. Creation is serialized with a lock file and
     the key is re-read afterwards, so two processes starting together end up
@@ -372,10 +381,6 @@ class ConfigStore:
         """Return True if at least one Falcon profile is stored."""
         return bool(self._data.get("profiles"))
 
-    def has_llm_config(self) -> bool:
-        """Return True if an LLM endpoint is stored."""
-        return bool(self._data.get("llm", {}).get("LLM_ENDPOINT"))
-
     # ---- Profile management ----
 
     def list_profiles(self) -> list[dict]:
@@ -498,9 +503,12 @@ class ConfigStore:
         Values that are empty in the stored config are removed from the
         environment so stale credentials don't linger. If no config file
         exists, the environment is left untouched (env-var mode, e.g. an MCP
-        server launched by an IDE with credentials in its environment). With
-        ``FALCON_DIGEST_USE_ENV=1``, values that were already in the process
-        environment at startup take precedence over the stored config.
+        server launched by an IDE with credentials in its environment). If
+        the file has no active profile (or no LLM settings), that group falls
+        back to the values the process started with, so saving only LLM
+        settings doesn't drop Falcon credentials supplied via the environment.
+        With ``FALCON_DIGEST_USE_ENV=1``, values that were already in the
+        process environment at startup take precedence over the stored config.
         """
         with self._lock:
             if not os.path.isfile(self._path) or self.load_error:
@@ -509,6 +517,8 @@ class ConfigStore:
             llm = dict(self._data.get("llm", {}))
         use_env = _env_overrides_enabled()
         for keys, source in ((_FALCON_KEYS, profile), (_LLM_KEYS, llm)):
+            if not any((source.get(k) or "").strip() for k in keys):
+                source = _ENV_AT_START  # nothing stored for this group: keep the startup environment
             for key in keys:
                 if use_env and _ENV_AT_START.get(key):
                     os.environ[key] = _ENV_AT_START[key]
@@ -528,8 +538,11 @@ class ConfigStore:
         exactly as the old runtime read them (``export``, quotes and inline
         comments behave the same). Commented-out ``#name`` profile blocks are
         imported too. If any value looks inconsistent, nothing is renamed and
-        ``migration_warning`` explains why; otherwise ``.env`` is renamed to
-        ``.env.migrated`` (0600) so it is no longer read anywhere.
+        ``migration_warning`` explains why; otherwise ``.env`` is moved to
+        ``.env.migrated`` (0600) in the data dir so it is no longer read
+        anywhere. Once the config is written the import counts as done: if
+        ``.env`` can't be moved (e.g. a read-only checkout) a warning says to
+        delete it by hand.
 
         Args:
             env_path: Path to the legacy ``.env`` file.
@@ -615,11 +628,15 @@ class ConfigStore:
         while os.path.exists(migrated_path):
             migrated_path = os.path.join(os.path.dirname(os.path.abspath(self._path)), f".env.migrated.{n}")
             n += 1
-        os.replace(env_path, migrated_path)
         try:
-            os.chmod(migrated_path, 0o600)
-        except OSError:
-            pass
+            _move_private(env_path, migrated_path)
+        except OSError as e:
+            logger.warning(
+                "Imported %s into the encrypted config store, but could not move it out of the "
+                "source tree (%s). It still contains plaintext secrets — delete it by hand.",
+                env_path, type(e).__name__,
+            )
+            return True
         logger.warning(
             "Migrated %d CID profile(s)%s from %s into the encrypted config store. The original file "
             "was renamed to %s and still contains plaintext secrets — delete it once verified.",
@@ -696,37 +713,70 @@ def parse_legacy_env_profiles(text: str) -> list[dict]:
     return blocks
 
 
-def _move_legacy_state() -> None:
+def _move_private(src: str, dst: str) -> None:
+    """Move a file, also across filesystems, leaving the destination 0600.
+
+    Raises:
+        OSError: If the file could not be moved. When the copy succeeded but
+            the source can't be removed, the copy is kept and this still raises.
+    """
+    try:
+        os.replace(src, dst)
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+        with open(src, "rb") as f:
+            write_private_file(dst, f.read())
+        os.unlink(src)
+    else:
+        try:
+            os.chmod(dst, 0o600)
+        except OSError:
+            pass
+
+
+def _move_legacy_state() -> bool:
     """Move state files left in the source tree by older versions into APP_DIR (by name only).
 
     Nothing is overwritten: a file is moved only if APP_DIR doesn't already
     have one with that name.
+
+    Returns:
+        True if anything was moved.
     """
-    if _is_within(APP_DIR, SOURCE_DIR) or _is_within(SOURCE_DIR, APP_DIR):
-        return
+    if _is_within(APP_DIR, LEGACY_DIR) or _is_within(LEGACY_DIR, APP_DIR):
+        return False
+    moved = False
     with _file_lock(os.path.join(APP_DIR, ".falcon_config.lock")):
         for name in STATE_FILES + STATE_DIRS:
-            src, dst = os.path.join(SOURCE_DIR, name), os.path.join(APP_DIR, name)
+            src, dst = os.path.join(LEGACY_DIR, name), os.path.join(APP_DIR, name)
             if os.path.lexists(src) and not os.path.lexists(dst):
                 try:
-                    os.replace(src, dst)
+                    if os.path.isdir(src):
+                        os.replace(src, dst)
+                    else:
+                        _move_private(src, dst)
+                    moved = True
                     logger.warning("Moved %s from the source tree to the data directory %s", name, APP_DIR)
                 except OSError as e:
-                    logger.error("Could not move %s to %s: %s", name, APP_DIR, e)
+                    logger.error("Could not move %s to %s: %s", name, APP_DIR, type(e).__name__)
+    return moved
 
-
-_move_legacy_state()
 
 # Module-level singleton
 config_store = ConfigStore()
 
 
 def load_config_into_env(env_path: str = LEGACY_ENV_FILE) -> None:
-    """Migrate a legacy ``.env`` if needed, then inject the stored config into ``os.environ``.
+    """Move legacy state into the data dir, migrate a legacy ``.env``, then inject the config.
 
     Safe to call repeatedly; every entry point (dashboard, MCP server, CLI,
-    cache daemon) goes through this via ``crwd_mcp_server`` import.
+    cache daemon) goes through this via ``crwd_mcp_server`` import, before
+    any users or cache file is read. Importing ``falcon_secrets`` alone
+    (e.g. from the git hooks) moves nothing.
     """
+    if _move_legacy_state():
+        config_store.reload()
     if config_store.load_error:
         return
     try:

@@ -318,3 +318,20 @@ def test_env_var_mode_dashboard(monkeypatch):
     at = _login(_app(), "admin")
     assert "Add a Falcon API profile to get started." not in [i.value for i in at.info]
     assert "Using credentials from the process environment" in _texts(at)
+
+
+def test_env_var_mode_survives_saving_llm_settings(monkeypatch):
+    UserManager().add_user("admin", PW, "admin")
+    start = {"FALCON_CLIENT_ID": "envclientid0000000000000001", "FALCON_CLIENT_SECRET": "env-secret",
+             "FALCON_BASE_URL": DEAD_URL}
+    monkeypatch.setattr(falcon_secrets, "_ENV_AT_START", start)
+    for k, v in start.items():
+        monkeypatch.setenv(k, v)
+    at = _login(_app(), "admin")
+    at = next(b for b in at.button if b.label == "Settings").click().run()
+    next(w for w in at.text_input if w.label == "LLM Endpoint").input("http://localhost:11434")
+    at = next(b for b in at.button if b.label == "Save LLM Settings").click().run()
+    assert config_store.exists() and not config_store.has_config()
+    at = at.run()
+    assert "Add a Falcon API profile to get started." not in [i.value for i in at.info]
+    assert os.environ["FALCON_CLIENT_ID"] == start["FALCON_CLIENT_ID"]
