@@ -95,6 +95,9 @@ _KEY_LOCK_FILE = os.path.join(APP_DIR, ".falcon_config.lock")
 
 _FALCON_KEYS = ("FALCON_CLIENT_ID", "FALCON_CLIENT_SECRET", "FALCON_BASE_URL")
 _LLM_KEYS = ("LLM_ENDPOINT", "LLM_API_KEY", "LLM_PROVIDER", "LLM_MODEL", "LLM_LOCAL_MODE")
+# Keys that show a group is actually configured (the others have stored defaults)
+_FALCON_ID_KEYS = ("FALCON_CLIENT_ID", "FALCON_CLIENT_SECRET")
+_LLM_ID_KEYS = ("LLM_ENDPOINT", "LLM_API_KEY")
 
 CLOUD_REGIONS = {
     "US-1": "https://api.crowdstrike.com",
@@ -516,8 +519,8 @@ class ConfigStore:
             profile = dict(self._data.get("profiles", {}).get(self._data.get("active_profile", ""), {}))
             llm = dict(self._data.get("llm", {}))
         use_env = _env_overrides_enabled()
-        for keys, source in ((_FALCON_KEYS, profile), (_LLM_KEYS, llm)):
-            if not any((source.get(k) or "").strip() for k in keys):
+        for keys, id_keys, source in ((_FALCON_KEYS, _FALCON_ID_KEYS, profile), (_LLM_KEYS, _LLM_ID_KEYS, llm)):
+            if not any((source.get(k) or "").strip() for k in id_keys):
                 source = _ENV_AT_START  # nothing stored for this group: keep the startup environment
             for key in keys:
                 if use_env and _ENV_AT_START.get(key):

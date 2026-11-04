@@ -173,6 +173,21 @@ class TestInjectToEnv:
         monkeypatch.delenv("LLM_ENDPOINT")
         monkeypatch.delenv("LLM_PROVIDER")
 
+    def test_saving_profile_keeps_llm_env_settings(self, cfg_path, monkeypatch):
+        start = {"LLM_ENDPOINT": "http://localhost:11434", "LLM_API_KEY": "ide-llm-key", "LLM_PROVIDER": "openai"}
+        monkeypatch.setattr(falcon_secrets, "_ENV_AT_START", start)
+        for k, v in start.items():
+            monkeypatch.setenv(k, v)
+        store = ConfigStore(path=cfg_path)
+        store.save_profile("prod", "cid-1", SECRET, "https://api.crowdstrike.com")
+        store.inject_to_env()
+        assert os.environ["LLM_ENDPOINT"] == "http://localhost:11434"
+        assert os.environ["LLM_API_KEY"] == "ide-llm-key"
+        assert os.environ["LLM_PROVIDER"] == "openai"
+        assert os.environ["FALCON_CLIENT_ID"] == "cid-1"
+        for k in ("FALCON_CLIENT_ID", "FALCON_CLIENT_SECRET", "FALCON_BASE_URL"):
+            monkeypatch.delenv(k)
+
     def test_deleting_last_profile_clears_falcon_env(self, cfg_path, monkeypatch):
         monkeypatch.setattr(falcon_secrets, "_ENV_AT_START", {})
         store = ConfigStore(path=cfg_path)
