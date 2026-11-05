@@ -1,12 +1,18 @@
-# Environment
+# Local state: credentials, encrypted config + key, users, cache, backups.
+# Never commit these (scripts/check_sensitive.py enforces it in git hooks).
 .env
+.env.*
+!.env.example
+.falcon_*
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa*
+
 venv/
 __pycache__/
 *.pyc
-
-# Cache files
-.falcon_cache.json
-.falcon_cache.json.tmp
 
 # IDE
 .idea/
@@ -19,15 +25,13 @@ __pycache__/
 # Backups, logs, PID files
 *.bak*
 *.log
-.falcon_cache_daemon.pid
-.falcon_cache_backups/
 
 # Legacy test files (integration, require live API)
-test_auth.py
-test_genai_hub.py
-test_mcp.py
-test_ngsiem_repos.py
-test_ngsiem_size.py
+/test_auth.py
+/test_genai_hub.py
+/test_mcp.py
+/test_ngsiem_repos.py
+/test_ngsiem_size.py
 
 # Claude Code session data
 .claude/

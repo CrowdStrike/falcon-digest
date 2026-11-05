@@ -30,9 +30,22 @@ logging.basicConfig(
 logger = logging.getLogger("falcon_mcp.daemon")
 
 from falcon_cache import cache as falcon_cache
+from falcon_secrets import config_store, refresh_env_from_store
+from crwd_mcp_server import validate_config, ConfigError
 
 
 def main():
+    # Credentials come from the encrypted config store (same as the dashboard)
+    refresh_env_from_store()
+    if config_store.load_error:
+        logger.error(config_store.load_error)
+        sys.exit(1)
+    try:
+        validate_config()
+    except ConfigError as e:
+        logger.error(str(e))
+        sys.exit(1)
+
     poll_interval = 300
     if len(sys.argv) > 1:
         try:

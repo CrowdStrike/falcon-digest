@@ -1,0 +1,5 @@
+#!/bin/sh
+# Block commits that would publish local credentials or tenant data.
+root=$(git rev-parse --show-toplevel)
+py="$root/venv/bin/python"; [ -x "$py" ] || py=python3
+exec "$py" "$root/scripts/check_sensitive.py" --staged

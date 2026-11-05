@@ -1,0 +1,7 @@
+# Falcon Digest Streamlit settings.
+#
+# The dashboard only listens on localhost by default. To allow access from
+# other machines, change this deliberately (e.g. "0.0.0.0") and put the
+# dashboard behind TLS / a reverse proxy.
+[server]
+address = "127.0.0.1"

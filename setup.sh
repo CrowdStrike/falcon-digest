@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CrowdStrike Falcon MCP — Setup Script
+# Falcon Digest — Setup Script
 # Usage: bash setup.sh
 
 set -e
@@ -52,69 +52,18 @@ echo "[3/6] Installing dependencies..."
 pip install -q -r requirements.txt
 echo "  Done — all packages installed"
 
-# ------ 4. Environment variables ------
+# ------ 4. Configuration ------
 echo ""
-echo "[4/6] Checking environment configuration..."
-
-if [ ! -f ".env" ]; then
-    if [ -f ".env.example" ]; then
-        cp .env.example .env
-        echo "  Created .env from .env.example"
-    else
-        cat > .env <<'ENVEOF'
-FALCON_CLIENT_ID=
-FALCON_CLIENT_SECRET=
-FALCON_BASE_URL=
-LLM_ENDPOINT=
-LLM_API_KEY=
-ENVEOF
-        echo "  Created blank .env"
-    fi
-
+echo "[4/6] Configuration"
+echo "  Credentials are no longer stored in .env. They are entered in the"
+echo "  dashboard Settings page and saved to an encrypted config file."
+if [ -f ".env" ]; then
     echo ""
-    echo "  Let's configure your CrowdStrike cloud region."
-    echo ""
-    echo "  Select your Falcon cloud:"
-    echo "    1) US-1  (api.crowdstrike.com)"
-    echo "    2) US-2  (api.us-2.crowdstrike.com)"
-    echo "    3) EU-1  (api.eu-1.crowdstrike.com)"
-    echo "    4) GOV-1 (api.laggar.gcw.crowdstrike.com)"
-    echo "    5) Other (enter custom URL)"
-    echo ""
-    read -r -p "  Choice [1-5]: " cloud_choice
-
-    case "$cloud_choice" in
-        1) FALCON_URL="https://api.crowdstrike.com" ;;
-        2) FALCON_URL="https://api.us-2.crowdstrike.com" ;;
-        3) FALCON_URL="https://api.eu-1.crowdstrike.com" ;;
-        4) FALCON_URL="https://api.laggar.gcw.crowdstrike.com" ;;
-        5)
-            read -r -p "  Enter Falcon API base URL: " FALCON_URL
-            ;;
-        *) FALCON_URL="https://api.crowdstrike.com"
-            echo "  Defaulting to US-1"
-            ;;
-    esac
-
-    # Write the chosen base URL into .env
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        sed -i '' "s|^FALCON_BASE_URL=.*|FALCON_BASE_URL=$FALCON_URL|" .env
-    else
-        sed -i "s|^FALCON_BASE_URL=.*|FALCON_BASE_URL=$FALCON_URL|" .env
-    fi
-    echo "  Set FALCON_BASE_URL=$FALCON_URL"
-
-    echo ""
-    echo "  *** Please edit .env and fill in your API credentials: ***"
-    echo "    FALCON_CLIENT_ID      (required)"
-    echo "    FALCON_CLIENT_SECRET   (required)"
-    echo ""
-    echo "  AI chat is optional. To enable it, also set:"
-    echo "    LLM_ENDPOINT   (any Anthropic Messages API-compatible endpoint)"
-    echo "    LLM_API_KEY"
-    echo ""
-else
-    echo "  .env already exists — skipping configuration"
+    echo "  Found an existing .env — on first dashboard start its Falcon/LLM"
+    echo "  values are imported into the encrypted config and the file is"
+    echo "  moved to ~/.falcon-digest/.env.migrated (or \$FALCON_DIGEST_HOME)."
+    echo "  Delete it once the dashboard works, because it still contains your"
+    echo "  plaintext secret."
 fi
 
 # ------ 5. Run tests (optional) ------
@@ -146,11 +95,14 @@ echo ""
 echo "  # Activate the virtual environment"
 echo "  source venv/bin/activate"
 echo ""
-echo "  # Run Dashboard v1 (7-tab layout with AI Chat tab)"
+echo "  # Run the dashboard (listens on 127.0.0.1 only, see .streamlit/config.toml)"
 echo "  streamlit run mcp_dashboard.py"
 echo ""
-echo "  # Run Dashboard v2 (5-tab layout with side chat panel)"
-echo "  streamlit run mcp_dashboard_v2.py"
+echo "  # First launch:"
+echo "  #   1. Copy the one-time setup token printed in this terminal"
+echo "  #      (also stored in ~/.falcon-digest/.falcon_users.json.setup)"
+echo "  #   2. Create the admin account in the browser using that token"
+echo "  #   3. Enter Falcon API credentials (and optionally LLM settings) in Settings"
 echo ""
 echo "  # Run MCP server (stdio, for IDE/editor integration)"
 echo "  python crwd_mcp_server.py"

@@ -319,6 +319,7 @@ class TestFalconCacheFilePersistence:
     def test_save_atomic_no_partial_write(self, tmp_path):
         """Verify atomic write: .tmp file should not persist after save."""
         import falcon_cache as fc_mod
+        from falcon_secrets import decrypt_cache
         original_file = fc_mod.CACHE_FILE
         fc_mod.CACHE_FILE = str(tmp_path / ".falcon_cache.json")
         try:
@@ -329,10 +330,13 @@ class TestFalconCacheFilePersistence:
             }
             cache._save_to_file()
 
-            # Main file should exist and be valid JSON
+            # Main file should exist and be readable (encrypted or plaintext)
             assert os.path.exists(fc_mod.CACHE_FILE)
-            with open(fc_mod.CACHE_FILE) as f:
-                data = json.load(f)
+            with open(fc_mod.CACHE_FILE, "rb") as f:
+                raw = f.read()
+            data = decrypt_cache(raw)
+            if data is None:
+                data = json.loads(raw)
             assert "entries" in data
             assert "k" in data["entries"]
 
